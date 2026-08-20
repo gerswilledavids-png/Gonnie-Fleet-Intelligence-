@@ -88,6 +88,42 @@ def get_profile(client: Client, user_id: str):
     return res.data
 
 
+def resolve_tenant_id(client: Client, profile: dict, user_id: str):
+    """
+    Ensure a non-master user has a valid tenant_id before tenant-scoped
+    records are loaded or written.
+
+    Legacy accounts may have a NULL profiles.tenant_id. If exactly one
+    tenant exists, attach it automatically. If there are zero or multiple
+    tenants, fail safely rather than ever inserting NULL tenant_id.
+    """
+    existing = profile.get("tenant_id")
+    if existing:
+        return existing
+
+    tenants_res = client.table("tenants").select("id, name").order("name").execute()
+    tenants = tenants_res.data or []
+
+    if len(tenants) == 1:
+        tenant_id = tenants[0]["id"]
+        client.table("profiles").update(
+            {"tenant_id": tenant_id}
+        ).eq("id", user_id).execute()
+        profile["tenant_id"] = tenant_id
+        return tenant_id
+
+    if len(tenants) == 0:
+        raise RuntimeError(
+            "Your account has no tenant/workspace assigned and no tenant exists yet. "
+            "Create a tenant first from the Master Admin console."
+        )
+
+    raise RuntimeError(
+        "Your account has no tenant/workspace assigned. "
+        "A Master Admin must assign this user to the correct tenant before data can be saved."
+    )
+
+
 def fetch_df(client: Client, table_name: str, tenant_filter: str = None) -> pd.DataFrame:
     q = client.table(table_name).select("*")
     if tenant_filter:
@@ -100,7 +136,13 @@ def tenant_payload(payload: dict, is_master: bool, tenant_filter, profile) -> di
     if is_master and tenant_filter:
         payload["tenant_id"] = tenant_filter
     elif not is_master:
-        payload["tenant_id"] = profile["tenant_id"]
+        tenant_id = profile.get("tenant_id")
+        if not tenant_id:
+            raise RuntimeError(
+                "No tenant is assigned to this user. "
+                "Please assign a tenant before saving fleet data."
+            )
+        payload["tenant_id"] = tenant_id
     return payload
 
 
@@ -174,6 +216,15 @@ def show_app():
         st.stop()
 
     is_master = profile["role"] == "master_admin"
+
+    # Repair legacy accounts whose profiles.tenant_id is NULL before any
+    # tenant-scoped data is loaded or written.
+    if not is_master:
+        try:
+            resolve_tenant_id(client, profile, user.id)
+        except Exception as e:
+            st.error(f"Workspace assignment required: {e}")
+            st.stop()
 
     st.sidebar.title("🚚 Gonnie Fleet Intelligence")
     st.sidebar.markdown(f"**{user.email}**")
