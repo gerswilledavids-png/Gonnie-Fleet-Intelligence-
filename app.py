@@ -115,7 +115,16 @@ def compute_trip_fields(row: dict, vehicle_row: dict = None) -> dict:
 
     km_per_l = round(distance / fuel_used, 2) if fuel_used else 0
     fuel_cost = round(fuel_used * cost_per_liter, 2)
-    expected_km_l = (vehicle_row or {}).get("expected_km_l") or 2.0
+    # vehicle_row is normally a pandas Series from iterrows().
+    # Do NOT use `vehicle_row or {}` here because pandas Series cannot
+    # be evaluated as a single True/False value.
+    if vehicle_row is None:
+        expected_km_l = 2.0
+    else:
+        expected_km_l = vehicle_row.get("expected_km_l", 2.0)
+        if pd.isna(expected_km_l) or expected_km_l <= 0:
+            expected_km_l = 2.0
+
     fuel_variance_pct = round(((km_per_l - expected_km_l) / expected_km_l) * 100, 1) if expected_km_l else 0
     theft_alert = fuel_variance_pct <= -20
     net_profit = round(revenue - fixed_cost - variable_cost, 2)
