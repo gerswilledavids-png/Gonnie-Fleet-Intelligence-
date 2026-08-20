@@ -460,6 +460,71 @@ def show_app():
                 display_df['km_per_l'] = np.where(display_df['fuel_used_liters'] > 0,
                                                    (display_df['distance_km'] / display_df['fuel_used_liters']).round(2), 0)
             st.dataframe(display_df, use_container_width=True)
+
+            # -------------------------------------------------
+            # DELETE TRIP — tenant/workspace scoped
+            # -------------------------------------------------
+            st.markdown("---")
+            st.subheader("🗑️ Manage Trip Records")
+            st.caption(
+                "Delete a trip only when you are certain it is incorrect. "
+                "Deletion is permanent and dashboard totals update automatically."
+            )
+
+            can_delete = is_master or profile.get("role") in ("master_admin", "workspace_admin", "admin")
+            if can_delete and "id" in display_df.columns and not display_df.empty:
+                delete_options = {}
+                for _, row in display_df.iterrows():
+                    record_id = row.get("id")
+                    if record_id:
+                        label = (
+                            f"Trip {row.get('trip_id', '')} • "
+                            f"{row.get('trip_date', '')} • "
+                            f"{row.get('registration', '')} • "
+                            f"{row.get('driver_name', '')} • "
+                            f"R{float(row.get('revenue', 0) or 0):,.2f}"
+                        )
+                        delete_options[label] = record_id
+
+                if delete_options:
+                    selected_label = st.selectbox(
+                        "Select trip to delete",
+                        list(delete_options.keys()),
+                        key="delete_trip_select",
+                    )
+                    confirm_delete = st.checkbox(
+                        "I understand this permanently deletes the selected trip.",
+                        key="confirm_delete_trip",
+                    )
+
+                    if st.button(
+                        "🗑️ Delete Selected Trip",
+                        type="secondary",
+                        disabled=not confirm_delete,
+                        key="delete_trip_button",
+                    ):
+                        selected_id = delete_options[selected_label]
+                        try:
+                            delete_query = client.table("trips").delete().eq("id", selected_id)
+                            if tenant_filter:
+                                delete_query = delete_query.eq("tenant_id", tenant_filter)
+                            elif not is_master:
+                                user_tenant_id = profile.get("tenant_id")
+                                if not user_tenant_id:
+                                    raise RuntimeError("No tenant is assigned to this user.")
+                                delete_query = delete_query.eq("tenant_id", user_tenant_id)
+
+                            result = delete_query.execute()
+                            deleted_rows = result.data or []
+                            if deleted_rows:
+                                st.success("Trip deleted successfully.")
+                                st.rerun()
+                            else:
+                                st.warning("Trip was not deleted. It may already be gone or you may not have permission.")
+                        except Exception as e:
+                            st.error(f"Could not delete trip: {e}")
+            elif not can_delete:
+                st.info("Only a Workspace Admin or Master Admin can delete trip records.")
         else:
             st.info("No trips logged yet.")
 
@@ -915,4 +980,3 @@ if "session" not in st.session_state:
     show_login()
 else:
     show_app()
- 
