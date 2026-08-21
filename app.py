@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import requests
 from datetime import date, datetime
 from supabase import create_client, Client
 
@@ -9,6 +10,18 @@ from supabase import create_client, Client
 # =========================================================
 SUPABASE_URL = "https://iguoiyslhyqpvlfjxksh.supabase.co"
 SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlndW9peXNsaHlxcHZsZmp4a3NoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODcyMDU3NTcsImV4cCI6MjEwMjc4MTc1N30.5Zh2MPcH3TpIJ--M2m-vN4pSICu5-5Ja8-zbgiRipyM"
+
+# Billing / Yoco config. The Yoco SECRET key itself is never referenced here —
+# it lives only as an Edge Function secret on the Supabase project, set via:
+#   supabase secrets set YOCO_SECRET_KEY=sk_live_xxx --project-ref iguoiyslhyqpvlfjxksh
+#   supabase secrets set YOCO_WEBHOOK_SECRET=whsec_xxx --project-ref iguoiyslhyqpvlfjxksh
+CHECKOUT_FUNCTION_URL = f"{SUPABASE_URL}/functions/v1/create-yoco-checkout"
+APP_BASE_URL = "https://8b6gr3mtlfbcjfc6kzuuds.streamlit.app"  # update if the deployed URL changes
+PLAN_LABELS = {
+    "starter": "Starter — R350/mo",
+    "professional": "Professional — R1,500/mo",
+    "enterprise": "Enterprise — custom pricing",
+}
 
 st.set_page_config(page_title="Gonnie Fleet Intelligence D.O.W", page_icon="🚚", layout="wide")
 
@@ -256,6 +269,7 @@ def show_app():
         "💰 Financial Forecast",
         "🧮 Job Profitability Estimator",
         "🛰️ GPS Tracker Log",
+        "💳 Billing & Subscription",
     ] + (["👑 Master Admin: Manage Tenants & Users"] if is_master else []))
 
     trips_df = fetch_df(client, "trips", tenant_filter)
@@ -945,7 +959,102 @@ def show_app():
             st.info("No GPS tracker records yet.")
 
     # -----------------------------------------------------
-    # 11. MASTER ADMIN
+    # 11. BILLING & SUBSCRIPTION
+    # -----------------------------------------------------
+    elif app_mode == "💳 Billing & Subscription":
+        st.title("💳 BILLING & SUBSCRIPTION")
+
+        billing_tenant_id = tenant_filter if (is_master and tenant_filter) else profile.get("tenant_id")
+
+        if not billing_tenant_id:
+            st.info("Select a specific tenant above to view or manage its billing.")
+        else:
+            sub_res = (
+                client.table("billing_subscriptions")
+                .select("*")
+                .eq("tenant_id", billing_tenant_id)
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            current_sub = sub_res.data[0] if sub_res.data else None
+
+            st.subheader("Current Plan")
+            if current_sub:
+                status = current_sub["status"]
+                status_icon = {"active": "✅", "pending": "⏳", "failed": "❌",
+                               "cancelled": "🚫", "expired": "⌛"}.get(status, "❔")
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Plan", PLAN_LABELS.get(current_sub["plan"], current_sub["plan"]))
+                c2.metric("Status", f"{status_icon} {status.upper()}")
+                c3.metric("Amount", f"R{current_sub['amount_cents'] / 100:,.2f}")
+                if current_sub.get("expires_at"):
+                    st.caption(f"Renews / expires: {current_sub['expires_at']}")
+            else:
+                st.warning("No subscription on record for this tenant yet.")
+
+            st.markdown("---")
+            st.subheader("Subscribe / Change Plan")
+            st.caption("Payments are processed securely by Yoco — card details never touch this app.")
+
+            plan_choice = st.selectbox("Choose a plan", ["starter", "professional", "enterprise"],
+                                        format_func=lambda p: PLAN_LABELS[p])
+
+            custom_amount = None
+            if plan_choice == "enterprise":
+                custom_amount_rand = st.number_input("Agreed monthly amount (R)", min_value=0.0, value=0.0, step=100.0)
+                custom_amount = int(custom_amount_rand * 100)
+
+            if st.button("Proceed to Payment", type="primary"):
+                if plan_choice == "enterprise" and (not custom_amount or custom_amount <= 0):
+                    st.error("Enter the agreed enterprise amount before proceeding.")
+                else:
+                    try:
+                        access_token = st.session_state["session"].access_token
+                        payload = {
+                            "plan": plan_choice,
+                            "success_url": f"{APP_BASE_URL}/?billing=success",
+                            "cancel_url": f"{APP_BASE_URL}/?billing=cancelled",
+                            "failure_url": f"{APP_BASE_URL}/?billing=failed",
+                        }
+                        if plan_choice == "enterprise":
+                            payload["amount_cents"] = custom_amount
+
+                        resp = requests.post(
+                            CHECKOUT_FUNCTION_URL,
+                            headers={
+                                "Authorization": f"Bearer {access_token}",
+                                "Content-Type": "application/json",
+                                "apikey": SUPABASE_ANON_KEY,
+                            },
+                            json=payload,
+                            timeout=30,
+                        )
+                        data = resp.json()
+                        if resp.ok and data.get("redirectUrl"):
+                            st.success("Checkout created — click below to complete payment.")
+                            st.link_button("💳 Pay with Yoco", data["redirectUrl"], type="primary")
+                        else:
+                            st.error(f"Could not start checkout: {data.get('error', resp.text)}")
+                    except Exception as e:
+                        st.error(f"Checkout request failed: {e}")
+
+            st.markdown("---")
+            st.subheader("Subscription History")
+            hist_res = (
+                client.table("billing_subscriptions")
+                .select("*")
+                .eq("tenant_id", billing_tenant_id)
+                .order("created_at", desc=True)
+                .execute()
+            )
+            if hist_res.data:
+                st.dataframe(pd.DataFrame(hist_res.data), use_container_width=True)
+            else:
+                st.info("No billing history yet.")
+
+    # -----------------------------------------------------
+    # 12. MASTER ADMIN
     # -----------------------------------------------------
     elif app_mode == "👑 Master Admin: Manage Tenants & Users":
         st.title("👑 Master Admin Console")
