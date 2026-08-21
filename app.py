@@ -342,6 +342,32 @@ def check_deployment_health():
         }
 
 
+def get_yoco_secret_status(client):
+    """Return only PRESENT/MISSING from the protected Supabase Vault."""
+    try:
+        res = client.rpc("get_yoco_secret_status_for_master_admin").execute()
+        value = res.data
+        return str(value) if value is not None else "MISSING"
+    except Exception:
+        return "UNKNOWN"
+
+
+def save_yoco_secret(client, secret):
+    """Send the Yoco secret directly to a Master-Admin-only Supabase RPC.
+    The secret is never written to Streamlit session state, logs, or the app source.
+    """
+    value = (secret or "").strip()
+    if not value:
+        raise ValueError("Enter the Yoco SECRET key.")
+    if not value.startswith(("sk_test_", "sk_live_")):
+        raise ValueError("Use the Yoco SECRET key beginning with sk_test_ or sk_live_.")
+    result = client.rpc(
+        "set_yoco_secret_for_master_admin",
+        {"p_secret": value},
+    ).execute()
+    return bool(result.data)
+
+
 def show_system_configuration():
     """Master Admin-only system diagnostics. Secrets are never displayed."""
     st.title("⚙️ System Configuration")
@@ -362,11 +388,49 @@ def show_system_configuration():
     c3.metric("Yoco Function URL", "Configured" if CHECKOUT_FUNCTION_URL else "Missing")
     c4.metric("App Base URL", "Configured" if APP_BASE_URL else "Missing")
 
-    st.markdown("### 🔐 Secret Protection")
+    st.markdown("### 🔐 Yoco Payment Secret")
     st.info(
-        "The Yoco secret key is intentionally NOT stored or displayed in this Streamlit app. "
-        "It must remain inside the Supabase Edge Function secret store. This screen only checks "
-        "whether the checkout endpoint is reachable; it cannot read the secret."
+        "Paste the Yoco SECRET key here. It is sent directly to a Master-Admin-only Supabase RPC "
+        "and stored in Supabase Vault. The key is never displayed, saved in Streamlit session state, "
+        "written to this app.py, or returned by the status check."
+    )
+
+    yoco_secret_status = get_yoco_secret_status(get_authed_client())
+    if yoco_secret_status == "PRESENT":
+        st.success("🟢 Yoco SECRET key is installed in Supabase Vault.")
+    elif yoco_secret_status == "MISSING":
+        st.error("🔴 Yoco SECRET key is not installed yet.")
+    else:
+        st.warning("🟠 Could not determine the Yoco secret status.")
+
+    with st.form("master_yoco_secret_form", clear_on_submit=True):
+        yoco_secret_input = st.text_input(
+            "Yoco SECRET key",
+            type="password",
+            placeholder="sk_test_... or sk_live_...",
+            help="Use the Yoco SECRET key, not the public key.",
+        )
+        save_secret = st.form_submit_button(
+            "🔒 Save Yoco SECRET to Supabase Vault",
+            type="primary",
+            use_container_width=True,
+        )
+        if save_secret:
+            try:
+                if save_yoco_secret(get_authed_client(), yoco_secret_input):
+                    st.success("✅ Yoco SECRET saved securely to Supabase Vault.")
+                    st.rerun()
+                else:
+                    st.error("Yoco SECRET was not saved.")
+            except Exception as exc:
+                st.error(f"Could not save Yoco SECRET: {exc}")
+
+    st.caption("Security: only Master Admin accounts can write or check this secret. The actual key is never shown.")
+
+    st.markdown("### 🛡️ Secret Protection")
+    st.info(
+        "The Yoco checkout Edge Function reads the secret from protected Supabase storage. "
+        "This dashboard can confirm presence but can never read the secret value back."
     )
 
     st.markdown("### 🟢 Live Health Checks")
