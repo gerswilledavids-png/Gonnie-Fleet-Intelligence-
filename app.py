@@ -249,12 +249,13 @@ def generate_eft_reference(tenant_name: str) -> str:
     return f"GF-{clean_name}-{suffix}"
 
 
-def create_pending_eft_subscription(client, tenant_id, plan, amount_cents, reference):
+def create_pending_eft_subscription(client, tenant_id, user_id, plan, amount_cents, reference):
     """Records a pending EFT payment intent in billing_subscriptions.
     Status stays 'pending_eft' until a Master Admin manually activates it.
     """
     payload = {
         "tenant_id": tenant_id,
+        "user_id": user_id,
         "plan": plan,
         "status": "pending_eft",
         "amount_cents": amount_cents,
@@ -1380,7 +1381,7 @@ def show_app():
                             )
                         )
                         record = create_pending_eft_subscription(
-                            client, billing_tenant_id, plan, amount_cents, reference
+                            client, billing_tenant_id, user.id, plan, amount_cents, reference
                         )
                         write_audit(
                             client, user, profile, "CREATE_PENDING_EFT",
