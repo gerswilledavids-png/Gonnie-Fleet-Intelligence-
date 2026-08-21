@@ -3,6 +3,8 @@ import pandas as pd
 import numpy as np
 import requests
 import time
+import random
+import string
 from datetime import date, datetime
 from supabase import create_client, Client
 
@@ -12,17 +14,29 @@ from supabase import create_client, Client
 SUPABASE_URL = "https://iguoiyslhyqpvlfjxksh.supabase.co"
 # Supabase keys for project iguoiyslhyqpvlfjxksh.
 # Publishable key: normal Streamlit/Auth client.
-# Legacy anon key: Yoco Edge Function gateway compatibility.
 SUPABASE_PUBLISHABLE_KEY = "sb_publishable_ZWfDcrO2Ja4tT7isnlA0SA_cbV_2h0E"
 SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlndW9peXNsaHlxcHZsZmp4a3NoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODcyMDU3NTcsImV4cCI6MjEwMjc4MTc1N30.5Zh2MPcH3TpIJ--M2m-vN4pSICu5-5Ja8-zbgiRipyM"
 
-CHECKOUT_FUNCTION_URL = f"{SUPABASE_URL}/functions/v1/create-yoco-checkout"
 APP_BASE_URL = "https://8b6gr3mtlfbcjfc6kzuuds.streamlit.app"
 
 PLAN_LABELS = {
     "starter": "Starter — R350/mo",
     "professional": "Professional — R1,500/mo",
     "enterprise": "Enterprise — custom pricing",
+}
+
+# ---------------------------------------------------------------------------
+# MANUAL EFT PAYMENT — replaces the Yoco checkout entirely.
+# Customer pays directly into this account; a Master Admin manually
+# flips the subscription to "active" once the payment is confirmed
+# in the bank app, using the approval panel in Billing & Subscription.
+# ---------------------------------------------------------------------------
+BANK_DETAILS = {
+    "account_name": "Gerswille Davids",
+    "bank": "GoTyme Bank",
+    "account_number": "51125371737",
+    "branch_code": "678910",
+    "account_type": "Current Account",
 }
 
 st.set_page_config(
@@ -226,6 +240,46 @@ def compliance_status(expiry):
 
 
 # =========================================================
+# EFT PAYMENT HELPERS (replaces Yoco)
+# =========================================================
+def generate_eft_reference(tenant_name: str) -> str:
+    """Short, unique reference so Gerswille can match incoming EFTs to tenants."""
+    suffix = "".join(random.choices(string.ascii_uppercase + string.digits, k=5))
+    clean_name = "".join(c for c in (tenant_name or "TENANT") if c.isalnum())[:10].upper()
+    return f"GF-{clean_name}-{suffix}"
+
+
+def create_pending_eft_subscription(client, tenant_id, plan, amount_cents, reference):
+    """Records a pending EFT payment intent in billing_subscriptions.
+    Status stays 'pending_eft' until a Master Admin manually activates it.
+    """
+    payload = {
+        "tenant_id": tenant_id,
+        "plan": plan,
+        "status": "pending_eft",
+        "amount_cents": amount_cents,
+        "payment_reference": reference,
+    }
+    res = client.table("billing_subscriptions").insert(payload).execute()
+    return res.data[0] if res.data else None
+
+
+def activate_subscription(client, user, profile, subscription_id, tenant_id):
+    """Master Admin action: flips a pending EFT subscription to active."""
+    old = client.table("billing_subscriptions").select("*").eq("id", subscription_id).single().execute().data
+    res = client.table("billing_subscriptions").update(
+        {"status": "active"}
+    ).eq("id", subscription_id).execute()
+    new_rows = res.data or []
+    write_audit(
+        client, user, profile, "MASTER_ACTIVATE_SUBSCRIPTION",
+        "billing_subscriptions", subscription_id, tenant_id,
+        old, new_rows[0] if new_rows else None,
+    )
+    return bool(new_rows)
+
+
+# =========================================================
 # MASTER ADMIN / AUDIT HELPERS
 # =========================================================
 def write_audit(client, user, profile, action, table_name=None,
@@ -284,42 +338,6 @@ def check_supabase_health():
         }
 
 
-def check_yoco_endpoint_health():
-    """Non-destructive reachability check for the Yoco Supabase Edge Function.
-
-    This deliberately does NOT send a checkout request, so it cannot create a
-    payment session or expose the Yoco secret. A 2xx/3xx/4xx response still
-    proves that the Edge Function endpoint is reachable; a 5xx/network error
-    indicates an infrastructure problem. The secret itself is never readable
-    from Streamlit and remains inside Supabase Edge Function secrets.
-    """
-    started = time.perf_counter()
-    try:
-        resp = requests.options(CHECKOUT_FUNCTION_URL, timeout=8)
-        latency_ms = round((time.perf_counter() - started) * 1000)
-        reachable = resp.status_code < 500
-        return {
-            "ok": reachable,
-            "reachable": reachable,
-            "status_code": resp.status_code,
-            "latency_ms": latency_ms,
-            "message": (
-                "Yoco checkout Edge Function is reachable. Secret is protected in Supabase."
-                if reachable
-                else f"Yoco Edge Function returned HTTP {resp.status_code}."
-            ),
-        }
-    except Exception as exc:
-        latency_ms = round((time.perf_counter() - started) * 1000)
-        return {
-            "ok": False,
-            "reachable": False,
-            "status_code": None,
-            "latency_ms": latency_ms,
-            "message": f"Yoco Edge Function check failed: {type(exc).__name__}",
-        }
-
-
 def check_deployment_health():
     """Check the configured public Streamlit deployment without logging secrets."""
     started = time.perf_counter()
@@ -342,38 +360,13 @@ def check_deployment_health():
         }
 
 
-def get_yoco_secret_status(client):
-    """Return only PRESENT/MISSING from the protected Supabase Vault."""
-    try:
-        res = client.rpc("get_yoco_secret_status_for_master_admin").execute()
-        value = res.data
-        return str(value) if value is not None else "MISSING"
-    except Exception:
-        return "UNKNOWN"
-
-
-def save_yoco_secret(client, secret):
-    """Send the Yoco secret directly to a Master-Admin-only Supabase RPC.
-    The secret is never written to Streamlit session state, logs, or the app source.
-    """
-    value = (secret or "").strip()
-    if not value:
-        raise ValueError("Enter the Yoco SECRET key.")
-    if not value.startswith(("sk_test_", "sk_live_")):
-        raise ValueError("Use the Yoco SECRET key beginning with sk_test_ or sk_live_.")
-    result = client.rpc(
-        "set_yoco_secret_for_master_admin",
-        {"p_secret": value},
-    ).execute()
-    return bool(result.data)
-
-
 def show_system_configuration():
     """Master Admin-only system diagnostics. Secrets are never displayed."""
     st.title("⚙️ System Configuration")
     st.caption(
-        "Master Admin only — live infrastructure diagnostics for Supabase, Yoco, "
-        "the public deployment and the application API. No secret values are shown."
+        "Master Admin only — live infrastructure diagnostics for Supabase and "
+        "the public deployment. No secret values are shown. Payments are handled "
+        "via manual EFT — there is no payment gateway secret to manage anymore."
     )
 
     if st.button("🔄 Run Live System Diagnostics", type="primary", use_container_width=True):
@@ -381,61 +374,13 @@ def show_system_configuration():
 
     st.markdown("---")
 
-    # Configuration presence — safe, non-secret information only.
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3)
     c1.metric("Supabase URL", "Configured" if SUPABASE_URL else "Missing")
     c2.metric("Supabase Client Key", _masked_secret_status(SUPABASE_PUBLISHABLE_KEY))
-    c3.metric("Yoco Function URL", "Configured" if CHECKOUT_FUNCTION_URL else "Missing")
-    c4.metric("App Base URL", "Configured" if APP_BASE_URL else "Missing")
-
-    st.markdown("### 🔐 Yoco Payment Secret")
-    st.info(
-        "Paste the Yoco SECRET key here. It is sent directly to a Master-Admin-only Supabase RPC "
-        "and stored in Supabase Vault. The key is never displayed, saved in Streamlit session state, "
-        "written to this app.py, or returned by the status check."
-    )
-
-    yoco_secret_status = get_yoco_secret_status(get_authed_client())
-    if yoco_secret_status == "PRESENT":
-        st.success("🟢 Yoco SECRET key is installed in Supabase Vault.")
-    elif yoco_secret_status == "MISSING":
-        st.error("🔴 Yoco SECRET key is not installed yet.")
-    else:
-        st.warning("🟠 Could not determine the Yoco secret status.")
-
-    with st.form("master_yoco_secret_form", clear_on_submit=True):
-        yoco_secret_input = st.text_input(
-            "Yoco SECRET key",
-            type="password",
-            placeholder="sk_test_... or sk_live_...",
-            help="Use the Yoco SECRET key, not the public key.",
-        )
-        save_secret = st.form_submit_button(
-            "🔒 Save Yoco SECRET to Supabase Vault",
-            type="primary",
-            use_container_width=True,
-        )
-        if save_secret:
-            try:
-                if save_yoco_secret(get_authed_client(), yoco_secret_input):
-                    st.success("✅ Yoco SECRET saved securely to Supabase Vault.")
-                    st.rerun()
-                else:
-                    st.error("Yoco SECRET was not saved.")
-            except Exception as exc:
-                st.error(f"Could not save Yoco SECRET: {exc}")
-
-    st.caption("Security: only Master Admin accounts can write or check this secret. The actual key is never shown.")
-
-    st.markdown("### 🛡️ Secret Protection")
-    st.info(
-        "The Yoco checkout Edge Function reads the secret from protected Supabase storage. "
-        "This dashboard can confirm presence but can never read the secret value back."
-    )
+    c3.metric("App Base URL", "Configured" if APP_BASE_URL else "Missing")
 
     st.markdown("### 🟢 Live Health Checks")
     supabase = check_supabase_health()
-    yoco = check_yoco_endpoint_health()
     deployment = check_deployment_health()
 
     def health_badge(result):
@@ -445,7 +390,7 @@ def show_system_configuration():
             return "🟠 REACHABLE / CHECK RESPONSE"
         return "🔴 DOWN / ERROR"
 
-    h1, h2, h3 = st.columns(3)
+    h1, h2 = st.columns(2)
     with h1:
         st.subheader("Supabase")
         st.metric("Status", health_badge(supabase))
@@ -454,13 +399,6 @@ def show_system_configuration():
         st.caption(supabase.get("message", ""))
 
     with h2:
-        st.subheader("Yoco Checkout")
-        st.metric("Endpoint", health_badge(yoco))
-        st.write(f"HTTP: {yoco.get('status_code') or '—'}")
-        st.write(f"Latency: {yoco.get('latency_ms', '—')} ms")
-        st.caption(yoco.get("message", ""))
-
-    with h3:
         st.subheader("Public Deployment")
         st.metric("Status", health_badge(deployment))
         st.write(f"HTTP: {deployment.get('status_code') or '—'}")
@@ -470,7 +408,6 @@ def show_system_configuration():
     st.markdown("### 🧪 Application API")
     api_checks = []
 
-    # Verify the authenticated Supabase client can actually reach the database.
     started = time.perf_counter()
     try:
         probe = get_authed_client().table("profiles").select("id").limit(1).execute()
@@ -490,7 +427,6 @@ def show_system_configuration():
             "Detail": f"Database probe failed: {type(exc).__name__}"
         })
 
-    # Show whether the public client credentials are present without printing them.
     api_checks.append({
         "Service": "Supabase Publishable Key",
         "Status": "🟢 PRESENT" if SUPABASE_PUBLISHABLE_KEY else "🔴 MISSING",
@@ -508,15 +444,9 @@ def show_system_configuration():
         "Python Runtime": ".".join(map(str, __import__("sys").version_info[:3])),
         "Diagnostic Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "Supabase Project": SUPABASE_URL.split("//", 1)[-1].split(".", 1)[0],
-        "Yoco Secret": "HIDDEN — Supabase Edge Function secret store",
+        "Payment Method": "Manual EFT — no gateway secret required",
     }
     st.dataframe(pd.DataFrame([runtime]), use_container_width=True, hide_index=True)
-
-    st.warning(
-        "If Yoco shows as reachable but payments still fail with a missing-secret message, "
-        "the problem is inside the Supabase Edge Function secret configuration — not this app. "
-        "The secret itself cannot be read by this dashboard."
-    )
 
 
 def master_update_profile(client, user, profile, user_id, fields):
@@ -1404,7 +1334,7 @@ def show_app():
             st.info("No GPS records yet.")
 
     # =====================================================
-    # BILLING
+    # BILLING — MANUAL EFT (replaces Yoco checkout)
     # =====================================================
     elif app_mode == "💳 Billing & Subscription":
         st.title("💳 BILLING & SUBSCRIPTION")
@@ -1424,45 +1354,73 @@ def show_app():
                 c1.metric("Plan",PLAN_LABELS.get(current["plan"],current["plan"]))
                 c2.metric("Status",str(current["status"]).upper())
                 c3.metric("Amount",f"R{(current.get('amount_cents') or 0)/100:,.2f}")
+                if str(current.get("status")) == "pending_eft" and current.get("payment_reference"):
+                    st.info(f"Payment reference on file: **{current['payment_reference']}**")
             else:
                 st.warning("No subscription on record.")
 
+            st.markdown("### Start or renew a subscription")
             plan=st.selectbox("Choose a plan",["starter","professional","enterprise"],
                               format_func=lambda p:PLAN_LABELS[p])
-            amount=None
+            amount_cents=35000  # default: Starter, R350.00
+            if plan=="professional":
+                amount_cents=150000
             if plan=="enterprise":
-                amount=int(st.number_input("Enterprise monthly amount (R)",0.0,step=100.0)*100)
+                amount_cents=int(st.number_input("Enterprise monthly amount (R)",0.0,step=100.0)*100)
 
-            if st.button("Proceed to Payment",type="primary"):
-                if plan=="enterprise" and not amount:
+            if st.button("💵 Generate EFT Payment Instructions",type="primary"):
+                if plan=="enterprise" and not amount_cents:
                     st.error("Enter the enterprise amount.")
                 else:
                     try:
-                        token=st.session_state["session"].access_token
-                        payload={
-                            "plan":plan,
-                            "success_url":f"{APP_BASE_URL}/?billing=success",
-                            "cancel_url":f"{APP_BASE_URL}/?billing=cancelled",
-                            "failure_url":f"{APP_BASE_URL}/?billing=failed",
-                        }
-                        if plan=="enterprise":
-                            payload["amount_cents"]=amount
-                        resp=requests.post(
-                            CHECKOUT_FUNCTION_URL,
-                            headers={
-                                "Authorization":f"Bearer {token}",
-                                "Content-Type":"application/json",
-                                "apikey":SUPABASE_ANON_KEY,
-                            },
-                            json=payload,timeout=30
+                        reference = generate_eft_reference(
+                            tenants_res_name := next(
+                                (t["name"] for t in (client.table("tenants").select("id,name").eq("id", billing_tenant_id).execute().data or [])),
+                                "TENANT"
+                            )
                         )
-                        data=resp.json()
-                        if resp.ok and data.get("redirectUrl"):
-                            st.link_button("💳 Pay with Yoco",data["redirectUrl"],type="primary")
-                        else:
-                            st.error(data.get("error",resp.text))
+                        record = create_pending_eft_subscription(
+                            client, billing_tenant_id, plan, amount_cents, reference
+                        )
+                        write_audit(
+                            client, user, profile, "CREATE_PENDING_EFT",
+                            "billing_subscriptions",
+                            record.get("id") if record else None,
+                            billing_tenant_id, None, record,
+                        )
+                        st.session_state["last_eft_reference"] = reference
+                        st.session_state["last_eft_amount"] = amount_cents
+                        st.rerun()
                     except Exception as e:
-                        st.error(f"Checkout request failed: {e}")
+                        st.error(f"Could not create payment instructions: {e}")
+
+            # Show payment instructions for the most recently generated reference.
+            if st.session_state.get("last_eft_reference"):
+                reference = st.session_state["last_eft_reference"]
+                amount = st.session_state.get("last_eft_amount", 0) / 100
+
+                st.markdown("---")
+                st.subheader("🏦 Pay via EFT")
+                st.info(
+                    f"Amount due: **R{amount:,.2f}**\n\n"
+                    "Please pay via EFT using the banking details below. "
+                    "Your account will be activated once payment is confirmed."
+                )
+
+                bc1, bc2 = st.columns(2)
+                with bc1:
+                    st.text_input("Account Name", value=BANK_DETAILS["account_name"], disabled=True)
+                    st.text_input("Bank", value=BANK_DETAILS["bank"], disabled=True)
+                    st.text_input("Account Number", value=BANK_DETAILS["account_number"], disabled=True)
+                with bc2:
+                    st.text_input("Branch Code", value=BANK_DETAILS["branch_code"], disabled=True)
+                    st.text_input("Account Type", value=BANK_DETAILS["account_type"], disabled=True)
+                    st.text_input("⚠️ Payment Reference (REQUIRED)", value=reference, disabled=True)
+
+                st.warning(
+                    f"⚠️ Use reference **{reference}** exactly as shown, "
+                    "or your payment cannot be matched to your account."
+                )
 
             hist=client.table("billing_subscriptions").select("*").eq(
                 "tenant_id",billing_tenant_id
@@ -1470,6 +1428,45 @@ def show_app():
             if hist:
                 st.subheader("Subscription History")
                 st.dataframe(pd.DataFrame(hist),use_container_width=True)
+
+        # ---------- MASTER ADMIN: EFT APPROVAL QUEUE ----------
+        if is_master:
+            st.markdown("---")
+            st.subheader("🔔 Pending EFT Approvals (All Tenants)")
+            st.caption(
+                "Check your GoTyme bank app for incoming EFTs matching the reference below, "
+                "then click Activate once you've confirmed the money has landed."
+            )
+
+            pending = client.table("billing_subscriptions").select("*").eq(
+                "status", "pending_eft"
+            ).order("created_at", desc=True).execute().data or []
+
+            if not pending:
+                st.success("No pending EFT payments.")
+            else:
+                tenants_lookup = {
+                    t["id"]: t["name"]
+                    for t in (client.table("tenants").select("id,name").execute().data or [])
+                }
+                for p in pending:
+                    tname = tenants_lookup.get(p.get("tenant_id"), "Unknown tenant")
+                    amt = (p.get("amount_cents") or 0) / 100
+                    ref = p.get("payment_reference") or "—"
+                    with st.container(border=True):
+                        pc1, pc2, pc3, pc4 = st.columns([3, 2, 2, 2])
+                        pc1.write(f"**{tname}**")
+                        pc2.write(f"R{amt:,.2f}")
+                        pc3.write(f"Ref: `{ref}`")
+                        if pc4.button("✅ Activate", key=f"activate_{p['id']}"):
+                            try:
+                                if activate_subscription(client, user, profile, p["id"], p.get("tenant_id")):
+                                    st.success(f"{tname} activated.")
+                                    st.rerun()
+                                else:
+                                    st.error("Could not activate — no change was made.")
+                            except Exception as e:
+                                st.error(f"Activation failed: {e}")
 
 
 # =========================================================
