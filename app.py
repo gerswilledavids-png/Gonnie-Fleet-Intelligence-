@@ -2,30 +2,22 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-from datetime import date
+import time
+from datetime import date, datetime
 from supabase import create_client, Client
 
 # =========================================================
 # CONFIG
 # =========================================================
 SUPABASE_URL = "https://iguoiyslhyqpvlfjxksh.supabase.co"
+# Supabase keys for project iguoiyslhyqpvlfjxksh.
+# Publishable key: normal Streamlit/Auth client.
+# Legacy anon key: Yoco Edge Function gateway compatibility.
+SUPABASE_PUBLISHABLE_KEY = "sb_publishable_ZWfDcrO2Ja4tT7isnlA0SA_cbV_2h0E"
 SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlndW9peXNsaHlxcHZsZmp4a3NoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODcyMDU3NTcsImV4cCI6MjEwMjc4MTc1N30.5Zh2MPcH3TpIJ--M2m-vN4pSICu5-5Ja8-zbgiRipyM"
 
 CHECKOUT_FUNCTION_URL = f"{SUPABASE_URL}/functions/v1/create-yoco-checkout"
 APP_BASE_URL = "https://8b6gr3mtlfbcjfc6kzuuds.streamlit.app"
-
-# Fail fast if the client key belongs to a different Supabase project.
-try:
-    import base64, json
-    _parts = SUPABASE_ANON_KEY.split(".")
-    _payload = json.loads(base64.urlsafe_b64decode(_parts[1] + "=" * (-len(_parts[1]) % 4)))
-    _expected_ref = SUPABASE_URL.split("//", 1)[1].split(".", 1)[0]
-    if _payload.get("ref") != _expected_ref or _payload.get("role") != "anon":
-        raise RuntimeError("Supabase client API key does not match the configured project.")
-except RuntimeError:
-    raise
-except Exception as _e:
-    raise RuntimeError("Invalid Supabase client API key configuration.") from _e
 
 PLAN_LABELS = {
     "starter": "Starter — R350/mo",
@@ -52,11 +44,11 @@ div[data-testid="stMetric"] { border-radius:10px; padding:8px; }
 # =========================================================
 @st.cache_resource
 def get_base_client() -> Client:
-    return create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+    return create_client(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY)
 
 
 def get_authed_client() -> Client:
-    client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+    client = create_client(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY)
     session = st.session_state.get("session")
     if session:
         client.auth.set_session(session.access_token, session.refresh_token)
@@ -254,6 +246,213 @@ def write_audit(client, user, profile, action, table_name=None,
     except Exception:
         # Audit failure must never crash the operational app.
         pass
+
+
+def _masked_secret_status(value):
+    """Return a safe status string without exposing a secret/token."""
+    if not value:
+        return "NOT PRESENT"
+    return "PRESENT (hidden)"
+
+
+def check_supabase_health():
+    """Non-destructive Supabase API health check."""
+    started = time.perf_counter()
+    url = f"{SUPABASE_URL}/auth/v1/settings"
+    try:
+        resp = requests.get(
+            url,
+            headers={"apikey": SUPABASE_PUBLISHABLE_KEY},
+            timeout=8,
+        )
+        latency_ms = round((time.perf_counter() - started) * 1000)
+        return {
+            "ok": 200 <= resp.status_code < 300,
+            "reachable": resp.status_code < 500,
+            "status_code": resp.status_code,
+            "latency_ms": latency_ms,
+            "message": "Supabase Auth/API responding." if 200 <= resp.status_code < 300 else f"Supabase returned HTTP {resp.status_code}.",
+        }
+    except Exception as exc:
+        latency_ms = round((time.perf_counter() - started) * 1000)
+        return {
+            "ok": False,
+            "reachable": False,
+            "status_code": None,
+            "latency_ms": latency_ms,
+            "message": f"Supabase API check failed: {type(exc).__name__}",
+        }
+
+
+def check_yoco_endpoint_health():
+    """Non-destructive reachability check for the Yoco Supabase Edge Function.
+
+    This deliberately does NOT send a checkout request, so it cannot create a
+    payment session or expose the Yoco secret. A 2xx/3xx/4xx response still
+    proves that the Edge Function endpoint is reachable; a 5xx/network error
+    indicates an infrastructure problem. The secret itself is never readable
+    from Streamlit and remains inside Supabase Edge Function secrets.
+    """
+    started = time.perf_counter()
+    try:
+        resp = requests.options(CHECKOUT_FUNCTION_URL, timeout=8)
+        latency_ms = round((time.perf_counter() - started) * 1000)
+        reachable = resp.status_code < 500
+        return {
+            "ok": reachable,
+            "reachable": reachable,
+            "status_code": resp.status_code,
+            "latency_ms": latency_ms,
+            "message": (
+                "Yoco checkout Edge Function is reachable. Secret is protected in Supabase."
+                if reachable
+                else f"Yoco Edge Function returned HTTP {resp.status_code}."
+            ),
+        }
+    except Exception as exc:
+        latency_ms = round((time.perf_counter() - started) * 1000)
+        return {
+            "ok": False,
+            "reachable": False,
+            "status_code": None,
+            "latency_ms": latency_ms,
+            "message": f"Yoco Edge Function check failed: {type(exc).__name__}",
+        }
+
+
+def check_deployment_health():
+    """Check the configured public Streamlit deployment without logging secrets."""
+    started = time.perf_counter()
+    try:
+        resp = requests.get(APP_BASE_URL, timeout=10, allow_redirects=True)
+        latency_ms = round((time.perf_counter() - started) * 1000)
+        return {
+            "ok": 200 <= resp.status_code < 400,
+            "status_code": resp.status_code,
+            "latency_ms": latency_ms,
+            "message": "Public app URL is responding." if resp.status_code < 400 else f"Public app returned HTTP {resp.status_code}.",
+        }
+    except Exception as exc:
+        latency_ms = round((time.perf_counter() - started) * 1000)
+        return {
+            "ok": False,
+            "status_code": None,
+            "latency_ms": latency_ms,
+            "message": f"Deployment health check failed: {type(exc).__name__}",
+        }
+
+
+def show_system_configuration():
+    """Master Admin-only system diagnostics. Secrets are never displayed."""
+    st.title("⚙️ System Configuration")
+    st.caption(
+        "Master Admin only — live infrastructure diagnostics for Supabase, Yoco, "
+        "the public deployment and the application API. No secret values are shown."
+    )
+
+    if st.button("🔄 Run Live System Diagnostics", type="primary", use_container_width=True):
+        st.session_state["system_diag_nonce"] = time.time()
+
+    st.markdown("---")
+
+    # Configuration presence — safe, non-secret information only.
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Supabase URL", "Configured" if SUPABASE_URL else "Missing")
+    c2.metric("Supabase Client Key", _masked_secret_status(SUPABASE_PUBLISHABLE_KEY))
+    c3.metric("Yoco Function URL", "Configured" if CHECKOUT_FUNCTION_URL else "Missing")
+    c4.metric("App Base URL", "Configured" if APP_BASE_URL else "Missing")
+
+    st.markdown("### 🔐 Secret Protection")
+    st.info(
+        "The Yoco secret key is intentionally NOT stored or displayed in this Streamlit app. "
+        "It must remain inside the Supabase Edge Function secret store. This screen only checks "
+        "whether the checkout endpoint is reachable; it cannot read the secret."
+    )
+
+    st.markdown("### 🟢 Live Health Checks")
+    supabase = check_supabase_health()
+    yoco = check_yoco_endpoint_health()
+    deployment = check_deployment_health()
+
+    def health_badge(result):
+        if result.get("ok"):
+            return "🟢 HEALTHY"
+        if result.get("reachable"):
+            return "🟠 REACHABLE / CHECK RESPONSE"
+        return "🔴 DOWN / ERROR"
+
+    h1, h2, h3 = st.columns(3)
+    with h1:
+        st.subheader("Supabase")
+        st.metric("Status", health_badge(supabase))
+        st.write(f"HTTP: {supabase.get('status_code') or '—'}")
+        st.write(f"Latency: {supabase.get('latency_ms', '—')} ms")
+        st.caption(supabase.get("message", ""))
+
+    with h2:
+        st.subheader("Yoco Checkout")
+        st.metric("Endpoint", health_badge(yoco))
+        st.write(f"HTTP: {yoco.get('status_code') or '—'}")
+        st.write(f"Latency: {yoco.get('latency_ms', '—')} ms")
+        st.caption(yoco.get("message", ""))
+
+    with h3:
+        st.subheader("Public Deployment")
+        st.metric("Status", health_badge(deployment))
+        st.write(f"HTTP: {deployment.get('status_code') or '—'}")
+        st.write(f"Latency: {deployment.get('latency_ms', '—')} ms")
+        st.caption(deployment.get("message", ""))
+
+    st.markdown("### 🧪 Application API")
+    api_checks = []
+
+    # Verify the authenticated Supabase client can actually reach the database.
+    started = time.perf_counter()
+    try:
+        probe = get_authed_client().table("profiles").select("id").limit(1).execute()
+        api_checks.append({
+            "Service": "Supabase Database API",
+            "Status": "🟢 OK",
+            "HTTP": "—",
+            "Latency (ms)": round((time.perf_counter() - started) * 1000),
+            "Detail": "Authenticated database query completed."
+        })
+    except Exception as exc:
+        api_checks.append({
+            "Service": "Supabase Database API",
+            "Status": "🔴 ERROR",
+            "HTTP": "—",
+            "Latency (ms)": round((time.perf_counter() - started) * 1000),
+            "Detail": f"Database probe failed: {type(exc).__name__}"
+        })
+
+    # Show whether the public client credentials are present without printing them.
+    api_checks.append({
+        "Service": "Supabase Publishable Key",
+        "Status": "🟢 PRESENT" if SUPABASE_PUBLISHABLE_KEY else "🔴 MISSING",
+        "HTTP": "—",
+        "Latency (ms)": "—",
+        "Detail": "Value hidden by design."
+    })
+
+    st.dataframe(pd.DataFrame(api_checks), use_container_width=True, hide_index=True)
+
+    st.markdown("### 📋 Current Runtime")
+    runtime = {
+        "Application": "Gonnie Fleet Intelligence D.O.W",
+        "Role": "Master Admin",
+        "Python Runtime": ".".join(map(str, __import__("sys").version_info[:3])),
+        "Diagnostic Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "Supabase Project": SUPABASE_URL.split("//", 1)[-1].split(".", 1)[0],
+        "Yoco Secret": "HIDDEN — Supabase Edge Function secret store",
+    }
+    st.dataframe(pd.DataFrame([runtime]), use_container_width=True, hide_index=True)
+
+    st.warning(
+        "If Yoco shows as reachable but payments still fail with a missing-secret message, "
+        "the problem is inside the Supabase Edge Function secret configuration — not this app. "
+        "The secret itself cannot be read by this dashboard."
+    )
 
 
 def master_update_profile(client, user, profile, user_id, fields):
@@ -533,6 +732,7 @@ def show_app():
 
     if is_master:
         nav.append("👑 Gonnie Platform Control Centre")
+        nav.append("⚙️ System Configuration")
 
     app_mode = st.sidebar.selectbox("Choose Navigation", nav)
 
@@ -541,6 +741,16 @@ def show_app():
     # =====================================================
     if app_mode == "👑 Gonnie Platform Control Centre":
         show_platform_control_centre(client, user, profile)
+        return
+
+    # =====================================================
+    # MASTER SYSTEM CONFIGURATION
+    # =====================================================
+    if app_mode == "⚙️ System Configuration":
+        if not is_master:
+            st.error("Master Admin access required.")
+            st.stop()
+        show_system_configuration()
         return
 
     trips_df = fetch_df(client, "trips", tenant_filter)
