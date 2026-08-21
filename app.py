@@ -9,10 +9,23 @@ from supabase import create_client, Client
 # CONFIG
 # =========================================================
 SUPABASE_URL = "https://iguoiyslhyqpvlfjxksh.supabase.co"
-SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsImJhdCI6IjE3ODcyMDU3NTcsImV4cCI6MjEwMjc4MTc1N30.5Zh2MPcH3TpIJ--M2m-vN4pSICu5-5Ja8-zbgiRipyM"
+SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlndW9peXNsaHlxcHZsZmp4a3NoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODcyMDU3NTcsImV4cCI6MjEwMjc4MTc1N30.5Zh2MPcH3TpIJ--M2m-vN4pSICu5-5Ja8-zbgiRipyM"
 
 CHECKOUT_FUNCTION_URL = f"{SUPABASE_URL}/functions/v1/create-yoco-checkout"
 APP_BASE_URL = "https://8b6gr3mtlfbcjfc6kzuuds.streamlit.app"
+
+# Fail fast if the client key belongs to a different Supabase project.
+try:
+    import base64, json
+    _parts = SUPABASE_ANON_KEY.split(".")
+    _payload = json.loads(base64.urlsafe_b64decode(_parts[1] + "=" * (-len(_parts[1]) % 4)))
+    _expected_ref = SUPABASE_URL.split("//", 1)[1].split(".", 1)[0]
+    if _payload.get("ref") != _expected_ref or _payload.get("role") != "anon":
+        raise RuntimeError("Supabase client API key does not match the configured project.")
+except RuntimeError:
+    raise
+except Exception as _e:
+    raise RuntimeError("Invalid Supabase client API key configuration.") from _e
 
 PLAN_LABELS = {
     "starter": "Starter — R350/mo",
@@ -1191,5 +1204,4 @@ def show_app():
 if "session" not in st.session_state:
     show_login()
 else:
-    show_app() 
- 
+    show_app()
