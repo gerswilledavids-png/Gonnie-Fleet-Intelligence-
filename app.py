@@ -1191,4 +1191,4 @@ def show_app():
 if "session" not in st.session_state:
     show_login()
 else:
-    show_app()
+    show_app() 
