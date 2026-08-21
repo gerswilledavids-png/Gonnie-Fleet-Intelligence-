@@ -9,11 +9,7 @@ from supabase import create_client, Client
 # CONFIG
 # =========================================================
 SUPABASE_URL = "https://iguoiyslhyqpvlfjxksh.supabase.co"
-# Supabase keys for project iguoiyslhyqpvlfjxksh.
-# Publishable key: normal Streamlit/Auth client.
-# Legacy anon key: Yoco Edge Function gateway compatibility.
-SUPABASE_PUBLISHABLE_KEY = "sb_publishable_ZWfDcrO2Ja4tT7isnlA0SA_cbV_2h0E"
-SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlndW9peXNsaHlxcHZsZmp4a3NoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODcyMDU3NTcsImV4cCI6MjEwMjc4MTc1N30.5Zh2MPcH3TpIJ--M2m-vN4pSICu5-5Ja8-zbgiRipyM"
+SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsImJhdCI6IjE3ODcyMDU3NTcsImV4cCI6MjEwMjc4MTc1N30.5Zh2MPcH3TpIJ--M2m-vN4pSICu5-5Ja8-zbgiRipyM"
 
 CHECKOUT_FUNCTION_URL = f"{SUPABASE_URL}/functions/v1/create-yoco-checkout"
 APP_BASE_URL = "https://8b6gr3mtlfbcjfc6kzuuds.streamlit.app"
@@ -43,11 +39,11 @@ div[data-testid="stMetric"] { border-radius:10px; padding:8px; }
 # =========================================================
 @st.cache_resource
 def get_base_client() -> Client:
-    return create_client(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY)
+    return create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
 
 def get_authed_client() -> Client:
-    client = create_client(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY)
+    client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
     session = st.session_state.get("session")
     if session:
         client.auth.set_session(session.access_token, session.refresh_token)
