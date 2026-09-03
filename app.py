@@ -11,13 +11,31 @@ from supabase import create_client, Client
 # =========================================================
 # CONFIG
 # =========================================================
-SUPABASE_URL = "https://iguoiyslhyqpvlfjxksh.supabase.co"
+def _secret_or_default(key, default):
+    """Prefer Streamlit secrets (st.secrets); fall back to the in-code
+    default only when secrets aren't configured, so the app still runs
+    locally/first-deploy without crashing."""
+    try:
+        return st.secrets[key]
+    except Exception:
+        return default
+
+SUPABASE_URL = _secret_or_default(
+    "SUPABASE_URL", "https://iguoiyslhyqpvlfjxksh.supabase.co"
+)
 # Supabase keys for project iguoiyslhyqpvlfjxksh.
 # Publishable key: normal Streamlit/Auth client.
-SUPABASE_PUBLISHABLE_KEY = "sb_publishable_ZWfDcrO2Ja4tT7isnlA0SA_cbV_2h0E"
-SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlndW9peXNsaHlxcHZsZmp4a3NoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODcyMDU3NTcsImV4cCI6MjEwMjc4MTc1N30.5Zh2MPcH3TpIJ--M2m-vN4pSICu5-5Ja8-zbgiRipyM"
+SUPABASE_PUBLISHABLE_KEY = _secret_or_default(
+    "SUPABASE_PUBLISHABLE_KEY", "sb_publishable_ZWfDcrO2Ja4tT7isnlA0SA_cbV_2h0E"
+)
+SUPABASE_ANON_KEY = _secret_or_default(
+    "SUPABASE_ANON_KEY",
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlndW9peXNsaHlxcHZsZmp4a3NoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODcyMDU3NTcsImV4cCI6MjEwMjc4MTc1N30.5Zh2MPcH3TpIJ--M2m-vN4pSICu5-5Ja8-zbgiRipyM",
+)
 
-APP_BASE_URL = "https://8b6gr3mtlfbcjfc6kzuuds.streamlit.app"
+APP_BASE_URL = _secret_or_default(
+    "APP_BASE_URL", "https://8b6gr3mtlfbcjfc6kzuuds.streamlit.app"
+)
 
 PLAN_LABELS = {
     "starter": "Starter — R350/mo",
@@ -30,13 +48,17 @@ PLAN_LABELS = {
 # Customer pays directly into this account; a Master Admin manually
 # flips the subscription to "active" once the payment is confirmed
 # in the bank app, using the approval panel in Billing & Subscription.
+#
+# These are pulled from Streamlit secrets (see .streamlit/secrets.toml)
+# so real banking details never live in source control. The defaults
+# below are placeholders only, used if secrets aren't configured yet.
 # ---------------------------------------------------------------------------
 BANK_DETAILS = {
-    "account_name": "Gerswille Davids",
-    "bank": "GoTyme Bank",
-    "account_number": "51125371737",
-    "branch_code": "678910",
-    "account_type": "Current Account",
+    "account_name": _secret_or_default("BANK_ACCOUNT_NAME", "SET IN st.secrets"),
+    "bank": _secret_or_default("BANK_NAME", "SET IN st.secrets"),
+    "account_number": _secret_or_default("BANK_ACCOUNT_NUMBER", "SET IN st.secrets"),
+    "branch_code": _secret_or_default("BANK_BRANCH_CODE", "SET IN st.secrets"),
+    "account_type": _secret_or_default("BANK_ACCOUNT_TYPE", "SET IN st.secrets"),
 }
 
 st.set_page_config(
@@ -93,15 +115,18 @@ def show_login():
             email = st.text_input("Email")
             password = st.text_input("Password", type="password")
             if st.form_submit_button("Log In", use_container_width=True):
-                try:
-                    res = get_base_client().auth.sign_in_with_password(
-                        {"email": email.strip(), "password": password}
-                    )
-                    st.session_state["session"] = res.session
-                    st.session_state["user"] = res.user
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Login failed: {e}")
+                if not email.strip() or not password:
+                    st.error("Email and password are required.")
+                else:
+                    try:
+                        res = get_base_client().auth.sign_in_with_password(
+                            {"email": email.strip(), "password": password}
+                        )
+                        st.session_state["session"] = res.session
+                        st.session_state["user"] = res.user
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Login failed: {e}")
 
     with tab_signup:
         st.markdown(
@@ -115,6 +140,10 @@ def show_login():
             if st.form_submit_button("Create Account", use_container_width=True):
                 if not company_name.strip() or not full_name.strip():
                     st.error("Company Name and Full Name are required.")
+                elif not email.strip() or not password:
+                    st.error("Email and password are required.")
+                elif len(password) < 6:
+                    st.error("Password must be at least 6 characters.")
                 else:
                     try:
                         get_base_client().auth.sign_up({
@@ -155,29 +184,42 @@ def fetch_df(client: Client, table_name: str, tenant_filter=None) -> pd.DataFram
 
 
 def resolve_tenant_id(client, profile, user_id):
+    """Returns the tenant_id already assigned to this profile.
+
+    IMPORTANT: this no longer auto-assigns a new signup to an existing
+    tenant just because there's only one tenant row in the database.
+    That was a cross-tenant data leak waiting to happen the moment a
+    second real tenant existed with no assignment step in between.
+    Tenant assignment must always be an explicit Master Admin action
+    (Platform Control Centre -> User Administration).
+    """
     existing = profile.get("tenant_id")
     if existing:
         return existing
 
-    tenants = client.table("tenants").select("id,name").order("name").execute().data or []
-    if len(tenants) == 1:
-        tenant_id = tenants[0]["id"]
-        client.table("profiles").update({"tenant_id": tenant_id}).eq("id", user_id).execute()
-        profile["tenant_id"] = tenant_id
-        return tenant_id
-
-    if not tenants:
-        raise RuntimeError("No workspace exists for this account.")
-
     raise RuntimeError(
-        "Your account has no workspace assigned. A Master Admin must assign one."
+        "Your account has no workspace assigned yet. A Master Admin must "
+        "assign one from the Platform Control Centre before you can continue."
     )
 
 
 def tenant_payload(payload, is_master, tenant_filter, profile):
-    if is_master and tenant_filter:
+    """Stamps payload with the tenant_id records must be saved under.
+
+    Raises RuntimeError instead of silently omitting tenant_id when a
+    Master Admin is on the "All Tenants" view and a non-master user has
+    no tenant assigned — either case would otherwise insert a row with
+    no tenant_id at all (an orphaned / cross-tenant-invisible record, or
+    a DB constraint error surfaced as a confusing exception).
+    """
+    if is_master:
+        if not tenant_filter:
+            raise RuntimeError(
+                "Select a specific tenant from the sidebar (not 'All Tenants') "
+                "before adding a record."
+            )
         payload["tenant_id"] = tenant_filter
-    elif not is_master:
+    else:
         tenant_id = profile.get("tenant_id")
         if not tenant_id:
             raise RuntimeError("No tenant is assigned to this user.")
@@ -191,7 +233,11 @@ def compute_trip_fields(row, vehicle_row=None):
     price = row.get("cost_per_liter") or 0
     revenue = row.get("revenue") or 0
     fixed = row.get("fixed_cost") or 0
-    variable = row.get("variable_cost") or fuel * price
+    # variable_cost is only auto-derived from fuel when it was never
+    # supplied at all (None) — an explicit 0 from the caller is respected.
+    variable = row.get("variable_cost")
+    if variable is None:
+        variable = fuel * price
 
     km_l = round(distance / fuel, 2) if fuel else 0
     fuel_cost = round(fuel * price, 2)
@@ -200,7 +246,7 @@ def compute_trip_fields(row, vehicle_row=None):
     if vehicle_row is not None:
         try:
             expected = vehicle_row.get("expected_km_l", 2.0)
-            if pd.isna(expected) or expected <= 0:
+            if expected is None or pd.isna(expected) or expected <= 0:
                 expected = 2.0
         except Exception:
             expected = 2.0
@@ -220,6 +266,7 @@ def compute_trip_fields(row, vehicle_row=None):
         "net_profit": profit,
         "profit_margin": margin,
         "cost_per_km": cost_km,
+        "variable_cost": variable,
     }
 
 
@@ -247,6 +294,27 @@ def generate_eft_reference(tenant_name: str) -> str:
     suffix = "".join(random.choices(string.ascii_uppercase + string.digits, k=5))
     clean_name = "".join(c for c in (tenant_name or "TENANT") if c.isalnum())[:10].upper()
     return f"GF-{clean_name}-{suffix}"
+
+
+def find_existing_pending_eft(client, tenant_id, plan, amount_cents):
+    """Looks for an already-pending EFT for this exact tenant/plan/amount so
+    a double-click (or repeated visits to Billing) doesn't create duplicate
+    pending_eft rows the Master Admin then has to untangle in the approval
+    queue."""
+    res = client.table("billing_subscriptions").select("*").eq(
+        "tenant_id", tenant_id
+    ).eq("plan", plan).eq("amount_cents", amount_cents).eq(
+        "status", "pending_eft"
+    ).order("created_at", desc=True).limit(1).execute()
+    rows = res.data or []
+    return rows[0] if rows else None
+
+
+def get_tenant_name(client, tenant_id):
+    """Small helper so the EFT reference generator doesn't need an inline
+    walrus-operator query embedded in a function call."""
+    rows = client.table("tenants").select("id,name").eq("id", tenant_id).execute().data or []
+    return rows[0]["name"] if rows else "TENANT"
 
 
 def create_pending_eft_subscription(client, tenant_id, user_id, plan, amount_cents, reference):
@@ -371,7 +439,7 @@ def show_system_configuration():
     )
 
     if st.button("🔄 Run Live System Diagnostics", type="primary", use_container_width=True):
-        st.session_state["system_diag_nonce"] = time.time()
+        st.rerun()
 
     st.markdown("---")
 
@@ -512,6 +580,8 @@ def show_platform_control_centre(client, user, profile):
             tenant_view["Trips"] = tenant_view["Trips"].fillna(0).astype(int)
 
         st.dataframe(tenant_view, use_container_width=True)
+    else:
+        st.info("No tenants created yet.")
 
     with st.expander("➕ Create a tenant/workspace"):
         with st.form("create_tenant"):
@@ -557,6 +627,8 @@ def show_platform_control_centre(client, user, profile):
             user_options[label] = uid
 
         with st.expander("🔐 Change User Role / Workspace"):
+            if tenants_df.empty:
+                st.info("Create a tenant first before assigning users to a workspace.")
             selected_label = st.selectbox("Select User", list(user_options.keys()))
             selected_id = user_options[selected_label]
             selected_row = profiles_df[profiles_df["id"].astype(str) == str(selected_id)].iloc[0]
@@ -578,7 +650,7 @@ def show_platform_control_centre(client, user, profile):
             tenant_labels = list(tenant_options.keys())
             default_idx = 0
             for i, label in enumerate(tenant_labels):
-                if tenant_options[label] == current_tenant:
+                if str(tenant_options[label]) == str(current_tenant):
                     default_idx = i
                     break
 
@@ -587,6 +659,12 @@ def show_platform_control_centre(client, user, profile):
                 tenant_labels,
                 index=default_idx,
             )
+
+            if new_role != "master_admin" and tenant_options[tenant_label] is None:
+                st.warning(
+                    "⚠️ This user will have no workspace assigned and won't be able "
+                    "to log in successfully until a Master Admin assigns one."
+                )
 
             if st.button("💾 Save User Administration", type="primary"):
                 try:
@@ -618,22 +696,22 @@ def show_platform_control_centre(client, user, profile):
         tc1, tc2, tc3, tc4 = st.columns(4)
         tc1.metric(
             "Users",
-            int((profiles_df["tenant_id"] == selected_tenant_id).sum())
+            int((profiles_df["tenant_id"].astype(str) == str(selected_tenant_id)).sum())
             if not profiles_df.empty and "tenant_id" in profiles_df else 0
         )
         tc2.metric(
             "Vehicles",
-            int((vehicles_df["tenant_id"] == selected_tenant_id).sum())
+            int((vehicles_df["tenant_id"].astype(str) == str(selected_tenant_id)).sum())
             if not vehicles_df.empty and "tenant_id" in vehicles_df else 0
         )
         tc3.metric(
             "Drivers",
-            int((drivers_df["tenant_id"] == selected_tenant_id).sum())
+            int((drivers_df["tenant_id"].astype(str) == str(selected_tenant_id)).sum())
             if not drivers_df.empty and "tenant_id" in drivers_df else 0
         )
         tc4.metric(
             "Trips",
-            int((trips_df["tenant_id"] == selected_tenant_id).sum())
+            int((trips_df["tenant_id"].astype(str) == str(selected_tenant_id)).sum())
             if not trips_df.empty and "tenant_id" in trips_df else 0
         )
 
@@ -651,6 +729,8 @@ def show_platform_control_centre(client, user, profile):
             billing["amount_R"] = billing["amount_cents"].fillna(0) / 100
 
         st.dataframe(billing, use_container_width=True)
+    else:
+        st.info("No subscriptions recorded yet.")
 
     # ---------- AUDIT ----------
     st.markdown("---")
@@ -710,6 +790,12 @@ def show_app():
             list(tenant_options.keys()),
         )
         tenant_filter = tenant_options[chosen]
+
+    # True whenever a Master Admin is on "All Tenants" and hasn't picked a
+    # specific workspace — used to block record-creation forms below, since
+    # tenant_payload() has no single tenant_id to stamp new rows with in
+    # that state.
+    master_no_tenant = is_master and not tenant_filter
 
     nav = [
         "📊 Executive Dashboard",
@@ -803,22 +889,26 @@ def show_app():
 
             if "driver_name" in trips_df:
                 st.subheader("👤 Driver Performance")
-                perf = trips_df.groupby("driver_name").agg(
-                    Trips=("trip_id","count"),
-                    Revenue_R=("revenue","sum"),
-                    Net_Profit_R=("net_profit","sum"),
-                ).reset_index()
+                agg_kwargs = {"Trips": ("trip_id", "count")}
+                if "revenue" in trips_df.columns:
+                    agg_kwargs["Revenue_R"] = ("revenue", "sum")
+                if "net_profit" in trips_df.columns:
+                    agg_kwargs["Net_Profit_R"] = ("net_profit", "sum")
+                perf = trips_df.groupby("driver_name").agg(**agg_kwargs).reset_index()
                 st.dataframe(perf, use_container_width=True)
 
             if "trip_date" in trips_df:
                 st.subheader("📅 Monthly Performance")
                 tmp = trips_df.copy()
                 tmp["_month"] = pd.to_datetime(tmp["trip_date"], errors="coerce").dt.to_period("M").astype(str)
-                monthly = tmp.groupby("_month").agg(
-                    Revenue_R=("revenue","sum"),
-                    Net_Profit_R=("net_profit","sum"),
-                )
-                st.line_chart(monthly)
+                agg_kwargs = {}
+                if "revenue" in tmp.columns:
+                    agg_kwargs["Revenue_R"] = ("revenue", "sum")
+                if "net_profit" in tmp.columns:
+                    agg_kwargs["Net_Profit_R"] = ("net_profit", "sum")
+                if agg_kwargs:
+                    monthly = tmp.groupby("_month").agg(**agg_kwargs)
+                    st.line_chart(monthly)
 
     # =====================================================
     # TRIP LOG
@@ -832,109 +922,141 @@ def show_app():
             for _, v in vehicles_df.iterrows()
         } if not vehicles_df.empty else {}
 
-        with st.expander("➕ Log a new trip", expanded=trips_df.empty):
-            with st.form("new_trip"):
-                c1,c2,c3 = st.columns(3)
-                trip_id = c1.text_input("Trip ID")
-                fleet_no = c2.text_input("Fleet No")
-                registration = c3.selectbox("Registration", list(veh_lookup.keys()) or ["(add vehicle first)"])
+        if master_no_tenant:
+            st.warning(
+                "⚠️ Select a specific tenant from the sidebar (not 'All Tenants') "
+                "before logging a new trip."
+            )
+        else:
+            with st.expander("➕ Log a new trip", expanded=trips_df.empty):
+                with st.form("new_trip"):
+                    c1,c2,c3 = st.columns(3)
+                    trip_id = c1.text_input("Trip ID")
+                    fleet_no = c2.text_input("Fleet No")
+                    registration = c3.selectbox("Registration", list(veh_lookup.keys()) or ["(add vehicle first)"])
 
-                c4,c5,c6 = st.columns(3)
-                driver_name = c4.selectbox("Driver Name", list(drivers_df["driver_name"]) if not drivers_df.empty else ["(add driver first)"])
-                driver_phone = c5.text_input("Driver Phone")
-                trip_date = c6.date_input("Trip Date")
+                    c4,c5,c6 = st.columns(3)
+                    driver_name = c4.selectbox("Driver Name", list(drivers_df["driver_name"]) if not drivers_df.empty else ["(add driver first)"])
+                    driver_phone = c5.text_input("Driver Phone")
+                    trip_date = c6.date_input("Trip Date")
 
-                c7,c8 = st.columns(2)
-                origin = c7.text_input("Destination Start", "D.O.W DEPOT")
-                destination = c8.text_input("Destination End")
+                    c7,c8 = st.columns(2)
+                    origin = c7.text_input("Destination Start", "D.O.W DEPOT")
+                    destination = c8.text_input("Destination End")
 
-                c9,c10,c11 = st.columns(3)
-                odo_start = c9.number_input("Odo Start", min_value=0.0)
-                odo_end = c10.number_input("Odo End", min_value=0.0)
-                distance_km = c11.number_input("Distance KM", min_value=0.0)
+                    c9,c10,c11 = st.columns(3)
+                    odo_start = c9.number_input("Odo Start", min_value=0.0)
+                    odo_end = c10.number_input("Odo End", min_value=0.0)
+                    distance_km = c11.number_input("Distance KM", min_value=0.0)
 
-                c12,c13 = st.columns(2)
-                fuel_used = c12.number_input("Fuel Used (L)", min_value=0.0)
-                price = c13.number_input("Cost/Litre (R)", min_value=0.0, value=25.31)
+                    c12,c13 = st.columns(2)
+                    fuel_used = c12.number_input("Fuel Used (L)", min_value=0.0)
+                    price = c13.number_input("Cost/Litre (R)", min_value=0.0, value=25.31)
 
-                c14,c15,c16 = st.columns(3)
-                revenue = c14.number_input("Revenue (R)", min_value=0.0)
-                fixed_cost = c15.number_input("Fixed Cost (R)", min_value=0.0)
-                variable_cost = c16.number_input("Variable Cost (R)", min_value=0.0)
+                    c14,c15,c16 = st.columns(3)
+                    revenue = c14.number_input("Revenue (R)", min_value=0.0)
+                    fixed_cost = c15.number_input("Fixed Cost (R)", min_value=0.0)
+                    variable_cost_input = c16.number_input("Variable Cost (R)", min_value=0.0)
+                    auto_variable = st.checkbox(
+                        "Auto-calculate Variable Cost from fuel used × price/litre",
+                        value=True,
+                        help="Uncheck to use the Variable Cost value you typed above exactly, "
+                             "including R0.00.",
+                    )
 
-                c17,c18,c19 = st.columns(3)
-                customer = c17.text_input("Customer")
-                cargo = c18.text_input("Cargo Type")
-                load_kg = c19.number_input("Load KG", min_value=0.0)
+                    c17,c18,c19 = st.columns(3)
+                    customer = c17.text_input("Customer")
+                    cargo = c18.text_input("Cargo Type")
+                    load_kg = c19.number_input("Load KG", min_value=0.0)
 
-                c20,c21,c22 = st.columns(3)
-                station = c20.text_input("Fuel Station")
-                gps = c21.checkbox("GPS Verified")
-                score = c22.number_input("Driver Score", min_value=0.0, max_value=100.0, value=95.0)
+                    c20,c21,c22 = st.columns(3)
+                    station = c20.text_input("Fuel Station")
+                    gps = c21.checkbox("GPS Verified")
+                    score = c22.number_input("Driver Score", min_value=0.0, max_value=100.0, value=95.0)
 
-                c23,c24 = st.columns(2)
-                maint = c23.selectbox("Maint Flag", ["None","SERVICE DUE","OVERDUE"])
-                paid = c24.selectbox("Paid Status", ["unpaid","paid"])
+                    c23,c24 = st.columns(2)
+                    maint = c23.selectbox("Maint Flag", ["None","SERVICE DUE","OVERDUE"])
+                    paid = c24.selectbox("Paid Status", ["unpaid","paid"])
 
-                manager = st.text_input("Manager Name")
-                manager_phone = st.text_input("Manager Phone")
-                notes = st.text_area("Trip Notes")
+                    manager = st.text_input("Manager Name")
+                    manager_phone = st.text_input("Manager Phone")
+                    notes = st.text_area("Trip Notes")
 
-                if st.form_submit_button("Save Trip"):
-                    auto_distance = odo_end - odo_start if odo_end > odo_start else distance_km
-                    calc = compute_trip_fields({
-                        "distance_km": auto_distance,
-                        "fuel_used_liters": fuel_used,
-                        "cost_per_liter": price,
-                        "revenue": revenue,
-                        "fixed_cost": fixed_cost,
-                        "variable_cost": variable_cost or fuel_used * price,
-                    }, veh_lookup.get(registration))
+                    if st.form_submit_button("Save Trip"):
+                        validation_errors = []
+                        if not veh_lookup or registration not in veh_lookup:
+                            validation_errors.append("Add a vehicle in Vehicle Register before logging a trip.")
+                        if drivers_df.empty or driver_name not in list(drivers_df["driver_name"]):
+                            validation_errors.append("Add a driver in Driver Register before logging a trip.")
+                        if not trip_id.strip():
+                            validation_errors.append("Trip ID is required.")
+                        elif not trips_df.empty and "trip_id" in trips_df.columns and trip_id.strip() in trips_df["trip_id"].astype(str).values:
+                            validation_errors.append(f"Trip ID '{trip_id}' already exists — use a unique Trip ID.")
+                        if odo_end and odo_start and odo_end < odo_start:
+                            validation_errors.append("Odo End cannot be before Odo Start.")
 
-                    payload = {
-                        "trip_id": trip_id,
-                        "fleet_no": fleet_no,
-                        "registration": registration,
-                        "driver_name": driver_name,
-                        "driver_phone": driver_phone,
-                        "trip_date": str(trip_date),
-                        "origin": origin,
-                        "destination": destination,
-                        "odo_start": odo_start,
-                        "odo_end": odo_end,
-                        "distance_km": auto_distance,
-                        "fuel_used_liters": fuel_used,
-                        "cost_per_liter": price,
-                        "revenue": revenue,
-                        "fixed_cost": fixed_cost,
-                        "variable_cost": variable_cost or fuel_used * price,
-                        "net_profit": calc["net_profit"],
-                        "customer_name": customer,
-                        "cargo_type": cargo,
-                        "load_kg": load_kg,
-                        "fuel_station": station,
-                        "gps_verified": gps,
-                        "driver_score": score,
-                        "maint_flag": maint,
-                        "paid_status": paid,
-                        "manager_name": manager,
-                        "manager_phone": manager_phone,
-                        "trip_notes": notes,
-                    }
+                        if validation_errors:
+                            for err in validation_errors:
+                                st.error(err)
+                            st.stop()
 
-                    try:
-                        payload = tenant_payload(payload, is_master, tenant_filter, profile)
-                        result = client.table("trips").insert(payload).execute()
-                        record = result.data[0] if result.data else None
-                        write_audit(client,user,profile,"CREATE","trips",
-                                    record.get("id") if record else None,
-                                    payload.get("tenant_id"),None,record)
-                        if calc["theft_alert"]:
-                            st.warning(f"🚨 Theft Alert: KM/L is {calc['fuel_variance_pct']}% below expected.")
-                        st.success(f"Trip saved. KM/L {calc['km_per_l']} | Profit R{calc['net_profit']:,.2f}")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Could not save trip: {e}")
+                        auto_distance = odo_end - odo_start if odo_end > odo_start else distance_km
+                        # None means "derive from fuel"; a real number (including 0)
+                        # from an unchecked auto-calc means "use exactly what was typed".
+                        variable_cost_for_calc = None if auto_variable else variable_cost_input
+                        calc = compute_trip_fields({
+                            "distance_km": auto_distance,
+                            "fuel_used_liters": fuel_used,
+                            "cost_per_liter": price,
+                            "revenue": revenue,
+                            "fixed_cost": fixed_cost,
+                            "variable_cost": variable_cost_for_calc,
+                        }, veh_lookup.get(registration))
+
+                        payload = {
+                            "trip_id": trip_id,
+                            "fleet_no": fleet_no,
+                            "registration": registration,
+                            "driver_name": driver_name,
+                            "driver_phone": driver_phone,
+                            "trip_date": str(trip_date),
+                            "origin": origin,
+                            "destination": destination,
+                            "odo_start": odo_start,
+                            "odo_end": odo_end,
+                            "distance_km": auto_distance,
+                            "fuel_used_liters": fuel_used,
+                            "cost_per_liter": price,
+                            "revenue": revenue,
+                            "fixed_cost": fixed_cost,
+                            "variable_cost": calc["variable_cost"],
+                            "net_profit": calc["net_profit"],
+                            "customer_name": customer,
+                            "cargo_type": cargo,
+                            "load_kg": load_kg,
+                            "fuel_station": station,
+                            "gps_verified": gps,
+                            "driver_score": score,
+                            "maint_flag": maint,
+                            "paid_status": paid,
+                            "manager_name": manager,
+                            "manager_phone": manager_phone,
+                            "trip_notes": notes,
+                        }
+
+                        try:
+                            payload = tenant_payload(payload, is_master, tenant_filter, profile)
+                            result = client.table("trips").insert(payload).execute()
+                            record = result.data[0] if result.data else None
+                            write_audit(client,user,profile,"CREATE","trips",
+                                        record.get("id") if record else None,
+                                        payload.get("tenant_id"),None,record)
+                            if calc["theft_alert"]:
+                                st.warning(f"🚨 Theft Alert: KM/L is {calc['fuel_variance_pct']}% below expected.")
+                            st.success(f"Trip saved. KM/L {calc['km_per_l']} | Profit R{calc['net_profit']:,.2f}")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Could not save trip: {e}")
 
         if not trips_df.empty:
             st.dataframe(trips_df, use_container_width=True)
@@ -953,23 +1075,30 @@ def show_app():
                 confirm = st.checkbox("I understand this permanently deletes the selected trip.")
                 if st.button("🗑️ Delete Selected Trip", disabled=not confirm):
                     rid = options[selected]
-                    try:
-                        q = client.table("trips").delete().eq("id", rid)
-                        if tenant_filter:
-                            q = q.eq("tenant_id", tenant_filter)
-                        elif not is_master:
-                            q = q.eq("tenant_id", profile["tenant_id"])
-                        old = trips_df[trips_df["id"] == rid].iloc[0].to_dict()
-                        res = q.execute()
-                        if res.data:
-                            write_audit(client,user,profile,"DELETE","trips",rid,
-                                        old.get("tenant_id"),old,None)
-                            st.success("Trip deleted.")
-                            st.rerun()
-                        else:
-                            st.warning("Trip was not deleted.")
-                    except Exception as e:
-                        st.error(f"Could not delete trip: {e}")
+                    old = trips_df[trips_df["id"] == rid].iloc[0].to_dict()
+
+                    # Defense in depth: for non-master users, refuse to delete
+                    # anything whose tenant_id doesn't match their own tenant,
+                    # even though the query below is already scoped that way.
+                    if not is_master and old.get("tenant_id") != profile.get("tenant_id"):
+                        st.error("You do not have permission to delete this trip.")
+                    else:
+                        try:
+                            q = client.table("trips").delete().eq("id", rid)
+                            if tenant_filter:
+                                q = q.eq("tenant_id", tenant_filter)
+                            elif not is_master:
+                                q = q.eq("tenant_id", profile["tenant_id"])
+                            res = q.execute()
+                            if res.data:
+                                write_audit(client,user,profile,"DELETE","trips",rid,
+                                            old.get("tenant_id"),old,None)
+                                st.success("Trip deleted.")
+                                st.rerun()
+                            else:
+                                st.warning("Trip was not deleted.")
+                        except Exception as e:
+                            st.error(f"Could not delete trip: {e}")
 
     # =====================================================
     # VEHICLE REGISTER
@@ -977,49 +1106,62 @@ def show_app():
     elif app_mode == "🚗 Vehicle Register":
         st.title("🚗 VEHICLE REGISTER")
 
-        with st.expander("➕ Add a vehicle", expanded=vehicles_df.empty):
-            with st.form("new_vehicle"):
-                c1,c2,c3 = st.columns(3)
-                registration = c1.text_input("Registration")
-                fleet_no = c2.text_input("Fleet No")
-                make = c3.text_input("Make")
-                c4,c5,c6 = st.columns(3)
-                model = c4.text_input("Model")
-                year = c5.number_input("Year", min_value=1980, max_value=2100, value=2020)
-                vin = c6.text_input("VIN / Engine No")
-                c7,c8,c9 = st.columns(3)
-                status = c7.selectbox("Status", ["Active","In Maintenance","Inactive"])
-                expected = c8.number_input("Expected KM/L", min_value=0.0, value=2.0)
-                service_cost = c9.number_input("Service Cost/KM", min_value=0.0, value=1.0)
-                c10,c11,c12 = st.columns(3)
-                insurance = c10.number_input("Monthly Insurance (R)", min_value=0.0)
-                next_service = c11.number_input("Next Service KM", min_value=0.0)
-                avg_daily = c12.number_input("Avg Daily KM", min_value=0.0)
-                c13,c14 = st.columns(2)
-                odo = c13.number_input("Current Odometer", min_value=0.0)
-                license_cost = c14.number_input("Annual License Cost", min_value=0.0)
+        if master_no_tenant:
+            st.warning(
+                "⚠️ Select a specific tenant from the sidebar (not 'All Tenants') "
+                "before adding a vehicle."
+            )
+        else:
+            with st.expander("➕ Add a vehicle", expanded=vehicles_df.empty):
+                with st.form("new_vehicle"):
+                    c1,c2,c3 = st.columns(3)
+                    registration = c1.text_input("Registration")
+                    fleet_no = c2.text_input("Fleet No")
+                    make = c3.text_input("Make")
+                    c4,c5,c6 = st.columns(3)
+                    model = c4.text_input("Model")
+                    year = c5.number_input("Year", min_value=1980, max_value=2100, value=2020)
+                    vin = c6.text_input("VIN / Engine No")
+                    c7,c8,c9 = st.columns(3)
+                    status = c7.selectbox("Status", ["Active","In Maintenance","Inactive"])
+                    expected = c8.number_input("Expected KM/L", min_value=0.0, value=2.0)
+                    service_cost = c9.number_input("Service Cost/KM", min_value=0.0, value=1.0)
+                    c10,c11,c12 = st.columns(3)
+                    insurance = c10.number_input("Monthly Insurance (R)", min_value=0.0)
+                    next_service = c11.number_input("Next Service KM", min_value=0.0)
+                    avg_daily = c12.number_input("Avg Daily KM", min_value=0.0)
+                    c13,c14 = st.columns(2)
+                    odo = c13.number_input("Current Odometer", min_value=0.0)
+                    license_cost = c14.number_input("Annual License Cost", min_value=0.0)
 
-                if st.form_submit_button("Save Vehicle"):
-                    payload = {
-                        "registration":registration,"fleet_no":fleet_no,"make":make,
-                        "model":model,"year":int(year),"vin_engine_no":vin,
-                        "status":status,"expected_km_l":expected,
-                        "service_cost_per_km":service_cost,
-                        "monthly_insurance":insurance,"next_service_km":next_service,
-                        "avg_daily_km":avg_daily,"fleet_health_score":100,
-                        "current_odometer":odo,"annual_license_cost":license_cost,
-                    }
-                    try:
-                        payload = tenant_payload(payload,is_master,tenant_filter,profile)
-                        res = client.table("vehicles").insert(payload).execute()
-                        record = res.data[0] if res.data else None
-                        write_audit(client,user,profile,"CREATE","vehicles",
-                                    record.get("id") if record else None,
-                                    payload.get("tenant_id"),None,record)
-                        st.success("Vehicle saved.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Could not save vehicle: {e}")
+                    if st.form_submit_button("Save Vehicle"):
+                        if not registration.strip():
+                            st.error("Registration is required.")
+                            st.stop()
+                        if not vehicles_df.empty and "registration" in vehicles_df.columns and registration.strip() in vehicles_df["registration"].astype(str).values:
+                            st.error(f"Vehicle '{registration}' already exists — use a unique Registration.")
+                            st.stop()
+
+                        payload = {
+                            "registration":registration,"fleet_no":fleet_no,"make":make,
+                            "model":model,"year":int(year),"vin_engine_no":vin,
+                            "status":status,"expected_km_l":expected,
+                            "service_cost_per_km":service_cost,
+                            "monthly_insurance":insurance,"next_service_km":next_service,
+                            "avg_daily_km":avg_daily,"fleet_health_score":100,
+                            "current_odometer":odo,"annual_license_cost":license_cost,
+                        }
+                        try:
+                            payload = tenant_payload(payload,is_master,tenant_filter,profile)
+                            res = client.table("vehicles").insert(payload).execute()
+                            record = res.data[0] if res.data else None
+                            write_audit(client,user,profile,"CREATE","vehicles",
+                                        record.get("id") if record else None,
+                                        payload.get("tenant_id"),None,record)
+                            st.success("Vehicle saved.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Could not save vehicle: {e}")
 
         if not vehicles_df.empty:
             st.dataframe(vehicles_df, use_container_width=True)
@@ -1030,42 +1172,52 @@ def show_app():
     elif app_mode == "👤 Driver Register":
         st.title("👤 DRIVER REGISTER")
 
-        with st.expander("➕ Add a driver", expanded=drivers_df.empty):
-            with st.form("new_driver"):
-                c1,c2,c3 = st.columns(3)
-                name = c1.text_input("Driver Name")
-                phone = c2.text_input("Phone")
-                license_no = c3.text_input("License No")
-                c4,c5 = st.columns(2)
-                license_expiry = c4.date_input("License Expiry")
-                prdp_expiry = c5.date_input("PrDP Expiry")
-                c6,c7,c8 = st.columns(3)
-                supervisor = c6.text_input("Supervisor")
-                rating = c7.number_input("Supervisor Rating",1.0,5.0,5.0)
-                avg_score = c8.number_input("Avg Driver Score",0.0,100.0,100.0)
-                c9,c10 = st.columns(2)
-                accidents = c9.number_input("Accidents",0)
-                fines = c10.number_input("Fines",0)
+        if master_no_tenant:
+            st.warning(
+                "⚠️ Select a specific tenant from the sidebar (not 'All Tenants') "
+                "before adding a driver."
+            )
+        else:
+            with st.expander("➕ Add a driver", expanded=drivers_df.empty):
+                with st.form("new_driver"):
+                    c1,c2,c3 = st.columns(3)
+                    name = c1.text_input("Driver Name")
+                    phone = c2.text_input("Phone")
+                    license_no = c3.text_input("License No")
+                    c4,c5 = st.columns(2)
+                    license_expiry = c4.date_input("License Expiry")
+                    prdp_expiry = c5.date_input("PrDP Expiry")
+                    c6,c7,c8 = st.columns(3)
+                    supervisor = c6.text_input("Supervisor")
+                    rating = c7.number_input("Supervisor Rating",1.0,5.0,5.0)
+                    avg_score = c8.number_input("Avg Driver Score",0.0,100.0,100.0)
+                    c9,c10 = st.columns(2)
+                    accidents = c9.number_input("Accidents",0)
+                    fines = c10.number_input("Fines",0)
 
-                if st.form_submit_button("Save Driver"):
-                    payload = {
-                        "driver_name":name,"driver_phone":phone,
-                        "license_number":license_no,"license_expiry":str(license_expiry),
-                        "prdp_expiry":str(prdp_expiry),"supervisor":supervisor,
-                        "rating":rating,"avg_driver_score":avg_score,
-                        "accidents":int(accidents),"fines":int(fines),"status":"active",
-                    }
-                    try:
-                        payload = tenant_payload(payload,is_master,tenant_filter,profile)
-                        res = client.table("drivers").insert(payload).execute()
-                        record = res.data[0] if res.data else None
-                        write_audit(client,user,profile,"CREATE","drivers",
-                                    record.get("id") if record else None,
-                                    payload.get("tenant_id"),None,record)
-                        st.success("Driver saved.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Could not save driver: {e}")
+                    if st.form_submit_button("Save Driver"):
+                        if not name.strip():
+                            st.error("Driver Name is required.")
+                            st.stop()
+
+                        payload = {
+                            "driver_name":name,"driver_phone":phone,
+                            "license_number":license_no,"license_expiry":str(license_expiry),
+                            "prdp_expiry":str(prdp_expiry),"supervisor":supervisor,
+                            "rating":rating,"avg_driver_score":avg_score,
+                            "accidents":int(accidents),"fines":int(fines),"status":"active",
+                        }
+                        try:
+                            payload = tenant_payload(payload,is_master,tenant_filter,profile)
+                            res = client.table("drivers").insert(payload).execute()
+                            record = res.data[0] if res.data else None
+                            write_audit(client,user,profile,"CREATE","drivers",
+                                        record.get("id") if record else None,
+                                        payload.get("tenant_id"),None,record)
+                            st.success("Driver saved.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Could not save driver: {e}")
 
         if not drivers_df.empty:
             st.dataframe(drivers_df, use_container_width=True)
@@ -1147,40 +1299,49 @@ def show_app():
         st.title("🔧 MAINTENANCE LOG")
         options = list(vehicles_df["registration"]) if not vehicles_df.empty else ["(add vehicle first)"]
 
-        with st.expander("➕ Log a service event"):
-            with st.form("new_maintenance"):
-                c1,c2 = st.columns(2)
-                service_date = c1.date_input("Service Date")
-                registration = c2.selectbox("Registration",options)
-                c3,c4 = st.columns(2)
-                fleet_no = c3.text_input("Fleet No")
-                service_type = c4.selectbox("Service Type",["Scheduled","Unscheduled"])
-                c5,c6 = st.columns(2)
-                odo_service = c5.number_input("Odo at Service",min_value=0.0)
-                next_service = c6.number_input("Next Service KM",min_value=0.0)
-                c7,c8 = st.columns(2)
-                cost = c7.number_input("Cost (R)",min_value=0.0)
-                workshop = c8.text_input("Workshop")
-                notes = st.text_area("Notes")
+        if master_no_tenant:
+            st.warning(
+                "⚠️ Select a specific tenant from the sidebar (not 'All Tenants') "
+                "before logging a service event."
+            )
+        else:
+            with st.expander("➕ Log a service event"):
+                with st.form("new_maintenance"):
+                    c1,c2 = st.columns(2)
+                    service_date = c1.date_input("Service Date")
+                    registration = c2.selectbox("Registration",options)
+                    c3,c4 = st.columns(2)
+                    fleet_no = c3.text_input("Fleet No")
+                    service_type = c4.selectbox("Service Type",["Scheduled","Unscheduled"])
+                    c5,c6 = st.columns(2)
+                    odo_service = c5.number_input("Odo at Service",min_value=0.0)
+                    next_service = c6.number_input("Next Service KM",min_value=0.0)
+                    c7,c8 = st.columns(2)
+                    cost = c7.number_input("Cost (R)",min_value=0.0)
+                    workshop = c8.text_input("Workshop")
+                    notes = st.text_area("Notes")
 
-                if st.form_submit_button("Save Service Event"):
-                    payload = {
-                        "service_date":str(service_date),"registration":registration,
-                        "fleet_no":fleet_no,"service_type":service_type,
-                        "odo_at_service":odo_service,"next_service_km":next_service,
-                        "cost":cost,"workshop":workshop,"notes":notes,
-                    }
-                    try:
-                        payload = tenant_payload(payload,is_master,tenant_filter,profile)
-                        res = client.table("maintenance_log").insert(payload).execute()
-                        record = res.data[0] if res.data else None
-                        write_audit(client,user,profile,"CREATE","maintenance_log",
-                                    record.get("id") if record else None,
-                                    payload.get("tenant_id"),None,record)
-                        st.success("Service event logged.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Could not save: {e}")
+                    if st.form_submit_button("Save Service Event"):
+                        if vehicles_df.empty or registration not in options:
+                            st.error("Add a vehicle in Vehicle Register before logging a service event.")
+                            st.stop()
+                        payload = {
+                            "service_date":str(service_date),"registration":registration,
+                            "fleet_no":fleet_no,"service_type":service_type,
+                            "odo_at_service":odo_service,"next_service_km":next_service,
+                            "cost":cost,"workshop":workshop,"notes":notes,
+                        }
+                        try:
+                            payload = tenant_payload(payload,is_master,tenant_filter,profile)
+                            res = client.table("maintenance_log").insert(payload).execute()
+                            record = res.data[0] if res.data else None
+                            write_audit(client,user,profile,"CREATE","maintenance_log",
+                                        record.get("id") if record else None,
+                                        payload.get("tenant_id"),None,record)
+                            st.success("Service event logged.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Could not save: {e}")
 
         maint_df = fetch_df(client,"maintenance_log",tenant_filter)
         if not maint_df.empty:
@@ -1193,8 +1354,8 @@ def show_app():
     # =====================================================
     elif app_mode == "💰 Financial Forecast":
         st.title("💰 FINANCIAL FORECAST")
+        st.caption("Showing service, license and compliance events due within the next 30 days.")
         today = date.today()
-        end = today + pd.Timedelta(days=30)
 
         rows=[]
         total_spend=0
@@ -1210,6 +1371,7 @@ def show_app():
                 if days <= 30:
                     rows.append({
                         "Vehicle":v.get("registration"),
+                        "Driver": "-",
                         "Event":"Service Due",
                         "Days Away":days,
                         "Priority":"URGENT" if days<=7 else "PLAN",
@@ -1261,7 +1423,7 @@ def show_app():
 
         mult=2 if return_trip=="YES" else 1
         total_km=distance*mult
-        fuel=total_km/km_l
+        fuel=total_km/km_l if km_l else 0
         fuel_cost=fuel*fuel_price
         total_cost=fuel_cost+driver_cost+toll+(maint+ins+lic)*total_km+other
         profit=revenue-total_cost
@@ -1279,57 +1441,77 @@ def show_app():
     elif app_mode == "🛰️ GPS Tracker Log":
         st.title("🛰️ GPS TRACKER LOG")
 
-        with st.expander("➕ Log a GPS trip record"):
-            with st.form("new_gps"):
-                c1,c2,c3=st.columns(3)
-                log_date=c1.date_input("Date")
-                registration=c2.text_input("Registration")
-                fleet_no=c3.text_input("Fleet No")
-                c4,c5=st.columns(2)
-                driver=c4.text_input("Driver Name")
-                location=c5.text_input("Location (Lat, Long)")
-                c6,c7=st.columns(2)
-                ignition_on=c6.time_input("Ignition ON")
-                ignition_off=c7.time_input("Ignition OFF")
-                c8,c9=st.columns(2)
-                odo_start=c8.number_input("Odo Start",0.0)
-                odo_end=c9.number_input("Odo End",0.0)
-                c10,c11,c12=st.columns(3)
-                idle=c10.number_input("Idle Time (min)",0.0)
-                fuel_start=c11.number_input("Fuel Start (%)",0.0,100.0,100.0)
-                fuel_end=c12.number_input("Fuel End (%)",0.0,100.0,0.0)
-                trip_distance=st.number_input("Trip Log Distance",0.0)
+        if master_no_tenant:
+            st.warning(
+                "⚠️ Select a specific tenant from the sidebar (not 'All Tenants') "
+                "before logging a GPS record."
+            )
+        else:
+            with st.expander("➕ Log a GPS trip record"):
+                with st.form("new_gps"):
+                    c1,c2,c3=st.columns(3)
+                    log_date=c1.date_input("Date")
+                    registration=c2.text_input("Registration")
+                    fleet_no=c3.text_input("Fleet No")
+                    c4,c5=st.columns(2)
+                    driver=c4.text_input("Driver Name")
+                    location=c5.text_input("Location (Lat, Long)")
+                    c6,c7=st.columns(2)
+                    ignition_on=c6.time_input("Ignition ON")
+                    ignition_off=c7.time_input("Ignition OFF")
+                    c8,c9=st.columns(2)
+                    odo_start=c8.number_input("Odo Start",0.0)
+                    odo_end=c9.number_input("Odo End",0.0)
+                    c10,c11,c12=st.columns(3)
+                    idle=c10.number_input("Idle Time (min)",0.0)
+                    fuel_start=c11.number_input("Fuel Start (%)",0.0,100.0,100.0)
+                    fuel_end=c12.number_input("Fuel End (%)",0.0,100.0,0.0)
+                    trip_distance=st.number_input("Trip Log Distance",0.0)
 
-                if st.form_submit_button("Save GPS Record"):
-                    payload={
-                        "log_date":str(log_date),"registration":registration,
-                        "fleet_no":fleet_no,"driver_name":driver,
-                        "ignition_on":str(ignition_on),"ignition_off":str(ignition_off),
-                        "odo_start":odo_start,"odo_end":odo_end,
-                        "idle_time_min":idle,"fuel_level_start":fuel_start,
-                        "fuel_level_end":fuel_end,"location":location,
-                        "trip_log_distance":trip_distance,
-                    }
-                    try:
-                        payload=tenant_payload(payload,is_master,tenant_filter,profile)
-                        res=client.table("gps_tracker_log").insert(payload).execute()
-                        record=res.data[0] if res.data else None
-                        write_audit(client,user,profile,"CREATE","gps_tracker_log",
-                                    record.get("id") if record else None,
-                                    payload.get("tenant_id"),None,record)
-                        st.success("GPS record saved.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Could not save: {e}")
+                    if st.form_submit_button("Save GPS Record"):
+                        if not registration.strip():
+                            st.error("Registration is required.")
+                            st.stop()
+                        payload={
+                            "log_date":str(log_date),"registration":registration,
+                            "fleet_no":fleet_no,"driver_name":driver,
+                            "ignition_on":str(ignition_on),"ignition_off":str(ignition_off),
+                            "odo_start":odo_start,"odo_end":odo_end,
+                            "idle_time_min":idle,"fuel_level_start":fuel_start,
+                            "fuel_level_end":fuel_end,"location":location,
+                            "trip_log_distance":trip_distance,
+                        }
+                        try:
+                            payload=tenant_payload(payload,is_master,tenant_filter,profile)
+                            res=client.table("gps_tracker_log").insert(payload).execute()
+                            record=res.data[0] if res.data else None
+                            write_audit(client,user,profile,"CREATE","gps_tracker_log",
+                                        record.get("id") if record else None,
+                                        payload.get("tenant_id"),None,record)
+                            st.success("GPS record saved.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Could not save: {e}")
 
         gps=fetch_df(client,"gps_tracker_log",tenant_filter)
         if not gps.empty:
             gps["gps_distance_km"]=gps["odo_end"].fillna(0)-gps["odo_start"].fillna(0)
+            invalid_odo = gps["gps_distance_km"] < 0
+
             gps["variance_pct"]=np.where(
-                gps["trip_log_distance"]>0,
+                (gps["trip_log_distance"]>0) & (~invalid_odo),
                 ((gps["gps_distance_km"]-gps["trip_log_distance"])/gps["trip_log_distance"]*100).round(1),0
             )
-            gps["flag"]=np.where(gps["variance_pct"].abs()>=10,"🚩 MISMATCH","OK")
+            gps["flag"]=np.where(
+                invalid_odo, "⚠️ INVALID ODO (end < start)",
+                np.where(gps["variance_pct"].abs()>=10,"🚩 MISMATCH","OK")
+            )
+            if invalid_odo.any():
+                st.warning(
+                    f"{int(invalid_odo.sum())} record(s) have Odo End before Odo Start — "
+                    "likely a typo or an odometer rollover. Distance/variance was not "
+                    "calculated for these rows; please correct them."
+                )
             st.dataframe(gps,use_container_width=True)
         else:
             st.info("No GPS records yet.")
@@ -1374,23 +1556,35 @@ def show_app():
                     st.error("Enter the enterprise amount.")
                 else:
                     try:
-                        reference = generate_eft_reference(
-                            tenants_res_name := next(
-                                (t["name"] for t in (client.table("tenants").select("id,name").eq("id", billing_tenant_id).execute().data or [])),
-                                "TENANT"
+                        existing = find_existing_pending_eft(
+                            client, billing_tenant_id, plan, amount_cents
+                        )
+                        if existing:
+                            # Reuse the existing pending payment instead of
+                            # creating a duplicate row for the same tenant/
+                            # plan/amount that's still awaiting approval.
+                            st.session_state["last_eft_reference"] = existing["payment_reference"]
+                            st.session_state["last_eft_amount"] = amount_cents
+                            st.info(
+                                "You already have a pending EFT for this plan and amount — "
+                                "showing the existing payment reference below instead of "
+                                "creating a new one."
                             )
-                        )
-                        record = create_pending_eft_subscription(
-                            client, billing_tenant_id, user.id, plan, amount_cents, reference
-                        )
-                        write_audit(
-                            client, user, profile, "CREATE_PENDING_EFT",
-                            "billing_subscriptions",
-                            record.get("id") if record else None,
-                            billing_tenant_id, None, record,
-                        )
-                        st.session_state["last_eft_reference"] = reference
-                        st.session_state["last_eft_amount"] = amount_cents
+                        else:
+                            reference = generate_eft_reference(
+                                get_tenant_name(client, billing_tenant_id)
+                            )
+                            record = create_pending_eft_subscription(
+                                client, billing_tenant_id, user.id, plan, amount_cents, reference
+                            )
+                            write_audit(
+                                client, user, profile, "CREATE_PENDING_EFT",
+                                "billing_subscriptions",
+                                record.get("id") if record else None,
+                                billing_tenant_id, None, record,
+                            )
+                            st.session_state["last_eft_reference"] = reference
+                            st.session_state["last_eft_amount"] = amount_cents
                         st.rerun()
                     except Exception as e:
                         st.error(f"Could not create payment instructions: {e}")
@@ -1435,7 +1629,7 @@ def show_app():
             st.markdown("---")
             st.subheader("🔔 Pending EFT Approvals (All Tenants)")
             st.caption(
-                "Check your GoTyme bank app for incoming EFTs matching the reference below, "
+                "Check your bank app for incoming EFTs matching the reference below, "
                 "then click Activate once you've confirmed the money has landed."
             )
 
