@@ -114,7 +114,7 @@ def show_login():
         with st.form("login_form"):
             email = st.text_input("Email")
             password = st.text_input("Password", type="password")
-            if st.form_submit_button("Log In", use_container_width=True):
+            if st.form_submit_button("Log In", width="stretch"):
                 if not email.strip() or not password:
                     st.error("Email and password are required.")
                 else:
@@ -137,7 +137,7 @@ def show_login():
             full_name = st.text_input("Your Full Name")
             email = st.text_input("Email", key="signup_email")
             password = st.text_input("Password", type="password", key="signup_password")
-            if st.form_submit_button("Create Account", use_container_width=True):
+            if st.form_submit_button("Create Account", width="stretch"):
                 if not company_name.strip() or not full_name.strip():
                     st.error("Company Name and Full Name are required.")
                 elif not email.strip() or not password:
@@ -438,7 +438,7 @@ def show_system_configuration():
         "via manual EFT — there is no payment gateway secret to manage anymore."
     )
 
-    if st.button("🔄 Run Live System Diagnostics", type="primary", use_container_width=True):
+    if st.button("🔄 Run Live System Diagnostics", type="primary", width="stretch"):
         st.rerun()
 
     st.markdown("---")
@@ -500,11 +500,17 @@ def show_system_configuration():
         "Service": "Supabase Publishable Key",
         "Status": "🟢 PRESENT" if SUPABASE_PUBLISHABLE_KEY else "🔴 MISSING",
         "HTTP": "—",
-        "Latency (ms)": "—",
+        # NOTE: was "—" (a string). That mixed with the integer millisecond
+        # values from the other rows above, so when Streamlit converted this
+        # column to an Arrow table it raised:
+        #   pyarrow.lib.ArrowInvalid: Could not convert '—' with type str:
+        #   tried to convert to int64
+        # None -> NaN keeps the column numeric; it just renders blank here.
+        "Latency (ms)": None,
         "Detail": "Value hidden by design."
     })
 
-    st.dataframe(pd.DataFrame(api_checks), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(api_checks), width="stretch", hide_index=True)
 
     st.markdown("### 📋 Current Runtime")
     runtime = {
@@ -515,7 +521,7 @@ def show_system_configuration():
         "Supabase Project": SUPABASE_URL.split("//", 1)[-1].split(".", 1)[0],
         "Payment Method": "Manual EFT — no gateway secret required",
     }
-    st.dataframe(pd.DataFrame([runtime]), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame([runtime]), width="stretch", hide_index=True)
 
 
 def master_update_profile(client, user, profile, user_id, fields):
@@ -579,7 +585,7 @@ def show_platform_control_centre(client, user, profile):
             )
             tenant_view["Trips"] = tenant_view["Trips"].fillna(0).astype(int)
 
-        st.dataframe(tenant_view, use_container_width=True)
+        st.dataframe(tenant_view, width="stretch")
     else:
         st.info("No tenants created yet.")
 
@@ -618,7 +624,7 @@ def show_platform_control_centre(client, user, profile):
             tenant_names = tenants_df.set_index("id")["name"].to_dict()
             display_profiles["tenant_name"] = display_profiles["tenant_id"].map(tenant_names)
 
-        st.dataframe(display_profiles, use_container_width=True)
+        st.dataframe(display_profiles, width="stretch")
 
         user_options = {}
         for _, row in profiles_df.iterrows():
@@ -728,7 +734,7 @@ def show_platform_control_centre(client, user, profile):
         if "amount_cents" in billing:
             billing["amount_R"] = billing["amount_cents"].fillna(0) / 100
 
-        st.dataframe(billing, use_container_width=True)
+        st.dataframe(billing, width="stretch")
     else:
         st.info("No subscriptions recorded yet.")
 
@@ -742,7 +748,7 @@ def show_platform_control_centre(client, user, profile):
             audit_view = audit_view.sort_values("created_at", ascending=False)
 
         limit = st.selectbox("Audit records to display", [25, 50, 100, 250], index=1)
-        st.dataframe(audit_view.head(limit), use_container_width=True)
+        st.dataframe(audit_view.head(limit), width="stretch")
     else:
         st.info("No audit events recorded yet.")
 
@@ -885,7 +891,7 @@ def show_app():
                 available = {k:v for k,v in group_cols.items() if v[0] in trips_df.columns}
                 if available:
                     perf = trips_df.groupby("registration").agg(**available).reset_index()
-                    st.dataframe(perf, use_container_width=True)
+                    st.dataframe(perf, width="stretch")
 
             if "driver_name" in trips_df:
                 st.subheader("👤 Driver Performance")
@@ -895,7 +901,7 @@ def show_app():
                 if "net_profit" in trips_df.columns:
                     agg_kwargs["Net_Profit_R"] = ("net_profit", "sum")
                 perf = trips_df.groupby("driver_name").agg(**agg_kwargs).reset_index()
-                st.dataframe(perf, use_container_width=True)
+                st.dataframe(perf, width="stretch")
 
             if "trip_date" in trips_df:
                 st.subheader("📅 Monthly Performance")
@@ -1059,7 +1065,7 @@ def show_app():
                             st.error(f"Could not save trip: {e}")
 
         if not trips_df.empty:
-            st.dataframe(trips_df, use_container_width=True)
+            st.dataframe(trips_df, width="stretch")
 
             can_delete = is_master or profile.get("role") in ("master_admin","tenant_admin","workspace_admin","admin")
             if can_delete and "id" in trips_df:
@@ -1164,7 +1170,7 @@ def show_app():
                             st.error(f"Could not save vehicle: {e}")
 
         if not vehicles_df.empty:
-            st.dataframe(vehicles_df, use_container_width=True)
+            st.dataframe(vehicles_df, width="stretch")
 
     # =====================================================
     # DRIVER REGISTER
@@ -1220,7 +1226,7 @@ def show_app():
                             st.error(f"Could not save driver: {e}")
 
         if not drivers_df.empty:
-            st.dataframe(drivers_df, use_container_width=True)
+            st.dataframe(drivers_df, width="stretch")
 
     # =====================================================
     # COMPLIANCE
@@ -1249,7 +1255,7 @@ def show_app():
                     "Days to Expiry":worst,
                     "Action Required":action,
                 })
-            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+            st.dataframe(pd.DataFrame(rows), width="stretch")
 
     # =====================================================
     # FUEL
@@ -1273,7 +1279,7 @@ def show_app():
                 monthly["Total_Fuel_L"] > 0,
                 (monthly["Total_KM"]/monthly["Total_Fuel_L"]).round(2),0
             )
-            st.dataframe(monthly,use_container_width=True)
+            st.dataframe(monthly,width="stretch")
             st.line_chart(monthly.set_index("_month")[["Total_Cost_R","Avg_KM_L"]])
 
             lookup = {
@@ -1290,7 +1296,7 @@ def show_app():
                 st.success("No theft alerts.")
             else:
                 st.warning(f"🚨 {len(alerts)} fuel-efficiency alerts detected.")
-                st.dataframe(alerts,use_container_width=True)
+                st.dataframe(alerts,width="stretch")
 
     # =====================================================
     # MAINTENANCE
@@ -1345,7 +1351,7 @@ def show_app():
 
         maint_df = fetch_df(client,"maintenance_log",tenant_filter)
         if not maint_df.empty:
-            st.dataframe(maint_df,use_container_width=True)
+            st.dataframe(maint_df,width="stretch")
         else:
             st.info("No maintenance events logged yet.")
 
@@ -1396,7 +1402,7 @@ def show_app():
         c2.metric("Urgent Items",urgent)
         c3.metric("Vehicles Impacted",len(impacted))
         c4.metric("Events",len(rows))
-        st.dataframe(pd.DataFrame(rows),use_container_width=True) if rows else st.success("No upcoming events.")
+        st.dataframe(pd.DataFrame(rows),width="stretch") if rows else st.success("No upcoming events.")
 
     # =====================================================
     # JOB PROFITABILITY
@@ -1512,7 +1518,7 @@ def show_app():
                     "likely a typo or an odometer rollover. Distance/variance was not "
                     "calculated for these rows; please correct them."
                 )
-            st.dataframe(gps,use_container_width=True)
+            st.dataframe(gps,width="stretch")
         else:
             st.info("No GPS records yet.")
 
@@ -1522,7 +1528,13 @@ def show_app():
     elif app_mode == "💳 Billing & Subscription":
         st.title("💳 BILLING & SUBSCRIPTION")
 
-        billing_tenant_id = tenant_filter if is_master and tenant_filter else profile.get("tenant_id")
+        # Master admins always need an explicit tenant selection from the
+        # sidebar — falling back to profile.get("tenant_id") here would let
+        # a master admin silently see/generate billing for whatever tenant
+        # happens to be on their own profile (e.g. leftover from before
+        # they were promoted to master_admin), instead of being told to
+        # pick a tenant.
+        billing_tenant_id = tenant_filter if is_master else profile.get("tenant_id")
 
         if not billing_tenant_id:
             st.info("Select a specific tenant from the Master Admin tenant selector.")
@@ -1622,7 +1634,7 @@ def show_app():
             ).order("created_at",desc=True).execute().data or []
             if hist:
                 st.subheader("Subscription History")
-                st.dataframe(pd.DataFrame(hist),use_container_width=True)
+                st.dataframe(pd.DataFrame(hist),width="stretch")
 
         # ---------- MASTER ADMIN: EFT APPROVAL QUEUE ----------
         if is_master:
