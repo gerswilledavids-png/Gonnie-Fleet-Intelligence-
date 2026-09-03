@@ -3,21 +3,39 @@ import pandas as pd
 import numpy as np
 import requests
 import time
+import os
 from datetime import date, datetime
 from supabase import create_client, Client
 
 # =========================================================
 # CONFIG
 # =========================================================
-SUPABASE_URL = "https://iguoiyslhyqpvlfjxksh.supabase.co"
-# Supabase keys for project iguoiyslhyqpvlfjxksh.
-# Publishable key: normal Streamlit/Auth client.
-# Legacy anon key: Yoco Edge Function gateway compatibility.
-SUPABASE_PUBLISHABLE_KEY = "sb_publishable_ZWfDcrO2Ja4tT7isnlA0SA_cbV_2h0E"
-SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlndW9peXNsaHlxcHZsZmp4a3NoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODcyMDU3NTcsImV4cCI6MjEwMjc4MTc1N30.5Zh2MPcH3TpIJ--M2m-vN4pSICu5-5Ja8-zbgiRipyM"
+def _setting(name: str, default: str = "") -> str:
+    """Read deployment configuration from Streamlit secrets or environment variables."""
+    try:
+        value = st.secrets.get(name)
+    except Exception:
+        value = None
+    return str(value or os.getenv(name, default) or "").strip()
 
-CHECKOUT_FUNCTION_URL = f"{SUPABASE_URL}/functions/v1/create-yoco-checkout"
-APP_BASE_URL = "https://8b6gr3mtlfbcjfc6kzuuds.streamlit.app"
+
+SUPABASE_URL = _setting("SUPABASE_URL", "https://iguoiyslhyqpvlfjxksh.supabase.co")
+# Publishable/anon keys are client credentials, but keep them outside source control.
+SUPABASE_PUBLISHABLE_KEY = _setting("SUPABASE_PUBLISHABLE_KEY")
+SUPABASE_ANON_KEY = _setting("SUPABASE_ANON_KEY")
+APP_BASE_URL = _setting("APP_BASE_URL", "https://8b6gr3mtlfbcjfc6kzuuds.streamlit.app")
+CHECKOUT_FUNCTION_URL = _setting(
+    "CHECKOUT_FUNCTION_URL",
+    f"{SUPABASE_URL}/functions/v1/create-yoco-checkout",
+)
+
+if not SUPABASE_PUBLISHABLE_KEY:
+    st.error("SUPABASE_PUBLISHABLE_KEY is not configured. Add it to Streamlit Secrets.")
+    st.stop()
+
+# Used only for the Yoco Edge Function gateway compatibility header.
+# The Yoco SECRET key itself must never be placed here.
+YOCO_GATEWAY_KEY = SUPABASE_ANON_KEY
 
 PLAN_LABELS = {
     "starter": "Starter — R350/mo",
@@ -422,6 +440,24 @@ def check_deployment_health():
         }
 
 
+def get_yoco_secret_status(client: Client) -> str:
+    try:
+        result = client.rpc("get_yoco_secret_status_for_master_admin").execute()
+        return str(result.data or "UNKNOWN").upper()
+    except Exception:
+        return "UNKNOWN"
+
+
+def save_yoco_secret(client: Client, secret: str) -> bool:
+    value = (secret or "").strip()
+    if not value:
+        raise ValueError("Enter the Yoco SECRET key.")
+    if not value.startswith(("sk_test_", "sk_live_")):
+        raise ValueError("Use the Yoco SECRET key beginning with sk_test_ or sk_live_.")
+    result = client.rpc("set_yoco_secret_for_master_admin", {"p_secret": value}).execute()
+    return bool(result.data)
+
+
 def show_system_configuration():
     """Master Admin-only system diagnostics. Secrets are never displayed."""
     st.title("⚙️ System Configuration")
@@ -448,6 +484,34 @@ def show_system_configuration():
         "It must remain inside the Supabase Edge Function secret store. This screen only checks "
         "whether the checkout endpoint is reachable; it cannot read the secret."
     )
+
+    st.markdown("### 🔐 Yoco Payment Secret")
+    st.info(
+        "Paste the Yoco SECRET key here once. It is sent to a Master-Admin-only "
+        "Supabase RPC and stored in Supabase Vault. The key is never displayed, "
+        "stored in Streamlit session state, or written into app.py."
+    )
+    secret_status = get_yoco_secret_status(get_authed_client())
+    if secret_status == "PRESENT":
+        st.success("🟢 Yoco SECRET is installed in Supabase Vault.")
+    elif secret_status == "MISSING":
+        st.error("🔴 Yoco SECRET is not installed yet.")
+    else:
+        st.warning("🟠 Could not determine Yoco secret status.")
+
+    with st.form("master_yoco_secret_form", clear_on_submit=True):
+        yoco_secret_input = st.text_input(
+            "Yoco SECRET key", type="password",
+            placeholder="sk_test_... or sk_live_...",
+            help="Use the Yoco SECRET key, not the Yoco public key.",
+        )
+        if st.form_submit_button("🔒 Save Yoco SECRET to Supabase Vault", type="primary", use_container_width=True):
+            try:
+                if save_yoco_secret(get_authed_client(), yoco_secret_input):
+                    st.success("Yoco SECRET saved securely to Supabase Vault.")
+                    st.rerun()
+            except Exception as exc:
+                st.error(f"Could not save Yoco SECRET: {exc}")
 
     st.markdown("### 🟢 Live Health Checks")
     supabase = check_supabase_health()
@@ -826,6 +890,22 @@ def show_platform_control_centre(client, user, profile):
 def show_app():
     client = get_authed_client()
     user = st.session_state["user"]
+    session = st.session_state.get("session")
+    if not session or not getattr(session, "access_token", None):
+        for key in ("session", "user"):
+            st.session_state.pop(key, None)
+        st.rerun()
+    try:
+        verified = client.auth.get_user(session.access_token)
+        if not verified or not verified.user or str(verified.user.id) != str(user.id):
+            raise RuntimeError("Session validation failed")
+        user = verified.user
+        st.session_state["user"] = user
+    except Exception:
+        for key in ("session", "user"):
+            st.session_state.pop(key, None)
+        st.warning("Your session expired. Please log in again.")
+        st.rerun()
     profile = get_profile(client, user.id)
 
     if not profile:
@@ -1564,7 +1644,7 @@ def show_app():
                             headers={
                                 "Authorization":f"Bearer {token}",
                                 "Content-Type":"application/json",
-                                "apikey":SUPABASE_ANON_KEY,
+                                **({"apikey": YOCO_GATEWAY_KEY} if YOCO_GATEWAY_KEY else {}),
                             },
                             json=payload,timeout=30
                         )
