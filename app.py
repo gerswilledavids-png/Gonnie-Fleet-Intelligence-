@@ -8,34 +8,96 @@ from datetime import date, datetime
 from supabase import create_client, Client
 
 # =========================================================
-# CONFIG
+# CONFIG / STREAMLIT SECRETS
 # =========================================================
+def _clean_secret(value) -> str:
+    """Normalize a secret value and reject common example placeholders."""
+    value = str(value or "").strip()
+    if not value:
+        return ""
+    placeholder_markers = (
+        "PASTE_YOUR_",
+        "YOUR_",
+        "REPLACE_ME",
+        "CHANGE_ME",
+    )
+    if any(marker in value.upper() for marker in placeholder_markers):
+        return ""
+    return value
+
+
 def _setting(name: str, default: str = "") -> str:
-    """Read deployment configuration from Streamlit secrets or environment variables."""
+    """
+    Read configuration safely from Streamlit Secrets first, then environment variables.
+
+    Supports both flat secrets:
+        SUPABASE_PUBLISHABLE_KEY = "..."
+
+    and an optional [supabase] section:
+        [supabase]
+        publishable_key = "..."
+        anon_key = "..."
+
+    Environment variables are only a fallback for local development.
+    """
+    # 1) Flat Streamlit secret (the normal Streamlit Cloud setup).
     try:
-        value = st.secrets.get(name)
+        value = _clean_secret(st.secrets.get(name))
+        if value:
+            return value
+
+        # 2) Optional [supabase] / [SUPABASE] section.
+        for section_name in ("supabase", "SUPABASE"):
+            section = st.secrets.get(section_name)
+            if hasattr(section, "get"):
+                section_value = _clean_secret(section.get(name))
+                if not section_value:
+                    section_value = _clean_secret(section.get(name.lower()))
+                if section_value:
+                    return section_value
     except Exception:
-        value = None
-    return str(value or os.getenv(name, default) or "").strip()
+        # st.secrets can be unavailable during local development.
+        pass
+
+    # 3) Environment variable fallback.
+    return _clean_secret(os.getenv(name, default))
 
 
 SUPABASE_URL = _setting("SUPABASE_URL", "https://iguoiyslhyqpvlfjxksh.supabase.co")
-# Publishable/anon keys are client credentials, but keep them outside source control.
+
+# Supabase client credential priority:
+#   1. SUPABASE_PUBLISHABLE_KEY (new key format)
+#   2. SUPABASE_ANON_KEY (legacy key format, still supported)
+#   3. SUPABASE_KEY (legacy generic alias, if used locally)
+# This prevents the app from breaking when Streamlit Secrets contains the
+# legacy anon key but not the newer publishable-key variable.
 SUPABASE_PUBLISHABLE_KEY = _setting("SUPABASE_PUBLISHABLE_KEY")
 SUPABASE_ANON_KEY = _setting("SUPABASE_ANON_KEY")
+SUPABASE_KEY = _setting("SUPABASE_KEY")
+SUPABASE_CLIENT_KEY = (
+    SUPABASE_PUBLISHABLE_KEY
+    or SUPABASE_ANON_KEY
+    or SUPABASE_KEY
+)
+
 APP_BASE_URL = _setting("APP_BASE_URL", "https://8b6gr3mtlfbcjfc6kzuuds.streamlit.app")
 CHECKOUT_FUNCTION_URL = _setting(
     "CHECKOUT_FUNCTION_URL",
     f"{SUPABASE_URL}/functions/v1/create-yoco-checkout",
 )
 
-if not SUPABASE_PUBLISHABLE_KEY:
-    st.error("SUPABASE_PUBLISHABLE_KEY is not configured. Add it to Streamlit Secrets.")
+if not SUPABASE_CLIENT_KEY:
+    st.error(
+        "Supabase credentials are not configured. Add either "
+        "SUPABASE_PUBLISHABLE_KEY or SUPABASE_ANON_KEY to Streamlit Cloud "
+        "App → Settings → Secrets, then reboot the app."
+    )
     st.stop()
 
 # Used only for the Yoco Edge Function gateway compatibility header.
-# The Yoco SECRET key itself must never be placed here.
-YOCO_GATEWAY_KEY = SUPABASE_ANON_KEY
+# Prefer the legacy anon key when it exists. The Yoco SECRET key itself must
+# never be placed in Streamlit Secrets or this app.
+YOCO_GATEWAY_KEY = SUPABASE_ANON_KEY or SUPABASE_PUBLISHABLE_KEY
 
 PLAN_LABELS = {
     "starter": "Starter — R350/mo",
@@ -62,11 +124,11 @@ div[data-testid="stMetric"] { border-radius:10px; padding:8px; }
 # =========================================================
 @st.cache_resource
 def get_base_client() -> Client:
-    return create_client(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY)
+    return create_client(SUPABASE_URL, SUPABASE_CLIENT_KEY)
 
 
 def get_authed_client() -> Client:
-    client = create_client(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY)
+    client = create_client(SUPABASE_URL, SUPABASE_CLIENT_KEY)
     session = st.session_state.get("session")
     if session:
         client.auth.set_session(session.access_token, session.refresh_token)
@@ -360,7 +422,7 @@ def check_supabase_health():
     try:
         resp = requests.get(
             url,
-            headers={"apikey": SUPABASE_PUBLISHABLE_KEY},
+            headers={"apikey": SUPABASE_CLIENT_KEY},
             timeout=8,
         )
         latency_ms = round((time.perf_counter() - started) * 1000)
@@ -474,7 +536,7 @@ def show_system_configuration():
     # Configuration presence — safe, non-secret information only.
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Supabase URL", "Configured" if SUPABASE_URL else "Missing")
-    c2.metric("Supabase Client Key", _masked_secret_status(SUPABASE_PUBLISHABLE_KEY))
+    c2.metric("Supabase Client Key", _masked_secret_status(SUPABASE_CLIENT_KEY))
     c3.metric("Yoco Function URL", "Configured" if CHECKOUT_FUNCTION_URL else "Missing")
     c4.metric("App Base URL", "Configured" if APP_BASE_URL else "Missing")
 
@@ -572,8 +634,8 @@ def show_system_configuration():
 
     # Show whether the public client credentials are present without printing them.
     api_checks.append({
-        "Service": "Supabase Publishable Key",
-        "Status": "🟢 PRESENT" if SUPABASE_PUBLISHABLE_KEY else "🔴 MISSING",
+        "Service": "Supabase Client Key",
+        "Status": "🟢 PRESENT" if SUPABASE_CLIENT_KEY else "🔴 MISSING",
         "HTTP": "—",
         "Latency (ms)": "—",
         "Detail": "Value hidden by design."
