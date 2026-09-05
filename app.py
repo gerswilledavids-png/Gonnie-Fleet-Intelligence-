@@ -6,18 +6,12 @@ import time
 from datetime import date, datetime
 from supabase import create_client, Client
 
-# =========================================================
-# PAGE CONFIG — MUST BE FIRST STREAMLIT COMMAND
-# =========================================================
 st.set_page_config(
     page_title="Gonnie Fleet Intelligence D.O.W",
     page_icon="🚚",
     layout="wide",
 )
 
-# =========================================================
-# APPLICATION CONFIGURATION
-# =========================================================
 SUPABASE_URL = "https://sruqcdkjmhrgrgzzvcot.supabase.co"
 SUPABASE_CLIENT_KEY = "sb_publishable_SVw4CNRyLGMZjTxB_3ewhg_9CnV1Osy"
 
@@ -47,9 +41,6 @@ div[data-testid="stMetric"] {
 """, unsafe_allow_html=True)
 
 
-# =========================================================
-# DATA / NUMERIC HELPERS
-# =========================================================
 def numeric_series(df, column):
     """Return a safe numeric Series for calculations."""
     if column not in df.columns:
@@ -71,9 +62,6 @@ def numeric_value(value, default=0.0):
         return float(default)
 
 
-# =========================================================
-# CLIENTS / AUTH
-# =========================================================
 @st.cache_resource
 def get_base_client() -> Client:
     return create_client(
@@ -91,10 +79,19 @@ def get_authed_client() -> Client:
     session = st.session_state.get("session")
 
     if session:
-        client.auth.set_session(
-            session.access_token,
-            session.refresh_token
-        )
+        try:
+            client.auth.set_session(
+                session.access_token,
+                session.refresh_token
+            )
+        except Exception:
+            # Stale/invalid refresh token (expired, revoked, or the
+            # project's auth keys changed). This used to propagate
+            # uncaught and crash the entire app on every rerun.
+            for key in ("session", "user"):
+                st.session_state.pop(key, None)
+            st.error("Your session expired. Please log in again.")
+            st.rerun()
 
     return client
 
@@ -111,9 +108,6 @@ def logout():
     st.rerun()
 
 
-# =========================================================
-# AUTH SCREENS
-# =========================================================
 def show_login():
     st.title("🚚 Gonnie Fleet Intelligence D.O.W")
     st.caption(
@@ -124,9 +118,6 @@ def show_login():
         ["Log In", "Sign Up"]
     )
 
-    # -----------------------------------------------------
-    # LOGIN
-    # -----------------------------------------------------
     with tab_login:
         with st.form("login_form"):
             email = st.text_input("Email")
@@ -137,7 +128,7 @@ def show_login():
 
             if st.form_submit_button(
                 "Log In",
-                use_container_width=True
+                width="stretch"
             ):
                 try:
                     res = get_base_client().auth.sign_in_with_password(
@@ -160,9 +151,6 @@ def show_login():
                 except Exception as e:
                     st.error(f"Login failed: {e}")
 
-    # -----------------------------------------------------
-    # SIGNUP
-    # -----------------------------------------------------
     with tab_signup:
         st.markdown(
             "New company? Create your account — "
@@ -191,7 +179,7 @@ def show_login():
 
             if st.form_submit_button(
                 "Create Account",
-                use_container_width=True
+                width="stretch"
             ):
                 if (
                     not company_name.strip()
@@ -237,9 +225,6 @@ def show_login():
                         )
 
 
-# =========================================================
-# DATABASE HELPERS
-# =========================================================
 def get_profile(
     client: Client,
     user_id: str
@@ -337,13 +322,6 @@ def tenant_payload(
     tenant_filter,
     profile
 ):
-    """
-    Attach exactly one tenant to every new operational record.
-
-    Master Admin must select a specific tenant.
-    'All Tenants' is intentionally not allowed for writes.
-    """
-
     if is_master:
         if not tenant_filter:
             raise RuntimeError(
@@ -366,9 +344,6 @@ def tenant_payload(
     return payload
 
 
-# =========================================================
-# TRIP CALCULATIONS
-# =========================================================
 def compute_trip_fields(
     row,
     vehicle_row=None
@@ -479,9 +454,6 @@ def compute_trip_fields(
     }
 
 
-# =========================================================
-# DELETE / AUDIT
-# =========================================================
 def write_audit(
     client,
     user,
@@ -493,8 +465,6 @@ def write_audit(
     old_data=None,
     new_data=None
 ):
-    """Write an audit record without breaking the main operation."""
-
     try:
         payload = {
             "actor_user_id":
@@ -544,12 +514,6 @@ def delete_scoped_record(
     record_id,
     tenant_id=None
 ):
-    """
-    Fetch the existing record first so the audit log receives
-    the actual deleted record even when Supabase does not return
-    deleted rows.
-    """
-
     if not record_id:
         raise ValueError(
             "A record ID is required."
@@ -574,9 +538,6 @@ def delete_scoped_record(
         else profile.get("tenant_id")
     )
 
-    # -----------------------------------------------------
-    # Fetch old record before deletion
-    # -----------------------------------------------------
     lookup = (
         client.table(table_name)
         .select("*")
@@ -601,9 +562,6 @@ def delete_scoped_record(
 
     old = rows[0]
 
-    # -----------------------------------------------------
-    # Delete
-    # -----------------------------------------------------
     delete_query = (
         client.table(table_name)
         .delete()
@@ -620,8 +578,6 @@ def delete_scoped_record(
 
     deleted_rows = result.data or []
 
-    # Some Supabase configurations return no deleted rows.
-    # Verify the record is gone.
     verify = (
         client.table(table_name)
         .select("id")
@@ -655,9 +611,6 @@ def delete_scoped_record(
     return old
 
 
-# =========================================================
-# MASTER TENANT DELETE
-# =========================================================
 def delete_tenant_permanently(
     client,
     user,
@@ -665,8 +618,6 @@ def delete_tenant_permanently(
     tenant_id,
     tenant_name
 ):
-    """Master Admin only."""
-
     if profile.get("role") != "master_admin":
         raise PermissionError(
             "Master Admin access is required."
@@ -702,8 +653,6 @@ def delete_tenant_permanently(
             "was loaded. Refresh and try again."
         )
 
-    # Billing FK is NO ACTION in the current schema,
-    # so billing rows are removed first.
     billing_rows = (
         client.table("billing_subscriptions")
         .select("*")
@@ -769,9 +718,6 @@ def delete_tenant_permanently(
     return live_tenant
 
 
-# =========================================================
-# COMPLIANCE
-# =========================================================
 def compliance_status(expiry):
     if not expiry:
         return "⚪ UNKNOWN", None
@@ -797,9 +743,6 @@ def compliance_status(expiry):
     return "🟢 COMPLIANT", days
 
 
-# =========================================================
-# SYSTEM HEALTH
-# =========================================================
 def _masked_secret_status(value):
     if not value:
         return "NOT PRESENT"
@@ -996,9 +939,6 @@ def check_deployment_health():
         }
 
 
-# =========================================================
-# YOCO SECRET RPC
-# =========================================================
 def get_yoco_secret_status(
     client: Client
 ) -> str:
@@ -1047,9 +987,6 @@ def save_yoco_secret(
     return bool(result.data)
 
 
-# =========================================================
-# SYSTEM CONFIGURATION
-# =========================================================
 def show_system_configuration():
     st.title("⚙️ System Configuration")
 
@@ -1062,7 +999,7 @@ def show_system_configuration():
     if st.button(
         "🔄 Run Live System Diagnostics",
         type="primary",
-        use_container_width=True
+        width="stretch"
     ):
         st.session_state[
             "system_diag_nonce"
@@ -1100,9 +1037,6 @@ def show_system_configuration():
         else "Missing"
     )
 
-    # -----------------------------------------------------
-    # SECRET PROTECTION
-    # -----------------------------------------------------
     st.markdown(
         "### 🔐 Secret Protection"
     )
@@ -1114,9 +1048,6 @@ def show_system_configuration():
         "secret store/Vault."
     )
 
-    # -----------------------------------------------------
-    # YOCO SECRET
-    # -----------------------------------------------------
     st.markdown(
         "### 🔐 Yoco Payment Secret"
     )
@@ -1164,7 +1095,7 @@ def show_system_configuration():
         if st.form_submit_button(
             "🔒 Save Yoco SECRET to Supabase Vault",
             type="primary",
-            use_container_width=True
+            width="stretch"
         ):
             try:
                 if save_yoco_secret(
@@ -1182,9 +1113,6 @@ def show_system_configuration():
                     f"Could not save Yoco SECRET: {exc}"
                 )
 
-    # -----------------------------------------------------
-    # HEALTH
-    # -----------------------------------------------------
     st.markdown(
         "### 🟢 Live Health Checks"
     )
@@ -1288,9 +1216,6 @@ def show_system_configuration():
                 )
             )
 
-        # -------------------------------------------------
-        # APPLICATION API
-        # -------------------------------------------------
         st.markdown(
             "### 🧪 Application API"
         )
@@ -1317,12 +1242,12 @@ def show_system_configuration():
                     "—",
 
                 "Latency (ms)":
-                    round(
+                    str(round(
                         (
                             time.perf_counter()
                             - started
                         ) * 1000
-                    ),
+                    )),
 
                 "Detail":
                     "Authenticated database query completed.",
@@ -1340,12 +1265,12 @@ def show_system_configuration():
                     "—",
 
                 "Latency (ms)":
-                    round(
+                    str(round(
                         (
                             time.perf_counter()
                             - started
                         ) * 1000
-                    ),
+                    )),
 
                 "Detail":
                     f"Database probe failed: "
@@ -1373,13 +1298,10 @@ def show_system_configuration():
 
         st.dataframe(
             pd.DataFrame(api_checks),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
-    # -----------------------------------------------------
-    # RUNTIME
-    # -----------------------------------------------------
     st.markdown(
         "### 📋 Current Runtime"
     )
@@ -1417,14 +1339,11 @@ def show_system_configuration():
 
     st.dataframe(
         pd.DataFrame([runtime]),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
 
-# =========================================================
-# MASTER ADMIN
-# =========================================================
 def master_update_profile(
     client,
     user,
@@ -1562,9 +1481,6 @@ def show_platform_control_centre(
         active_subs
     )
 
-    # -----------------------------------------------------
-    # TENANTS
-    # -----------------------------------------------------
     st.markdown("---")
 
     st.subheader(
@@ -1632,12 +1548,9 @@ def show_platform_control_centre(
 
         st.dataframe(
             tenant_view,
-            use_container_width=True
+            width="stretch"
         )
 
-    # -----------------------------------------------------
-    # CREATE TENANT
-    # -----------------------------------------------------
     with st.expander(
         "➕ Create a tenant/workspace"
     ):
@@ -1702,9 +1615,6 @@ def show_platform_control_centre(
                             f"Could not create tenant: {e}"
                         )
 
-    # -----------------------------------------------------
-    # USER ADMINISTRATION
-    # -----------------------------------------------------
     st.markdown("---")
 
     st.subheader(
@@ -1735,7 +1645,7 @@ def show_platform_control_centre(
 
         st.dataframe(
             display_profiles,
-            use_container_width=True
+            width="stretch"
         )
 
         user_options = {}
@@ -1881,9 +1791,6 @@ def show_platform_control_centre(
                                 f"Could not update user: {e}"
                             )
 
-    # -----------------------------------------------------
-    # DELETE TENANT
-    # -----------------------------------------------------
     st.markdown("---")
 
     st.subheader(
@@ -1971,7 +1878,7 @@ def show_platform_control_centre(
                     for k, v in impact.items()
                 ]
             ),
-            use_container_width=True,
+            width="stretch",
             hide_index=True
         )
 
@@ -2033,9 +1940,6 @@ def show_platform_control_centre(
                     f"Tenant deletion failed: {e}"
                 )
 
-    # -----------------------------------------------------
-    # TENANT INTELLIGENCE
-    # -----------------------------------------------------
     st.markdown("---")
 
     st.subheader(
@@ -2127,9 +2031,6 @@ def show_platform_control_centre(
             else 0
         )
 
-    # -----------------------------------------------------
-    # BILLING
-    # -----------------------------------------------------
     st.markdown("---")
 
     st.subheader(
@@ -2175,12 +2076,9 @@ def show_platform_control_centre(
 
         st.dataframe(
             billing,
-            use_container_width=True
+            width="stretch"
         )
 
-    # -----------------------------------------------------
-    # AUDIT
-    # -----------------------------------------------------
     st.markdown("---")
 
     st.subheader(
@@ -2207,7 +2105,7 @@ def show_platform_control_centre(
 
         st.dataframe(
             audit_view.head(limit),
-            use_container_width=True
+            width="stretch"
         )
 
     else:
@@ -2216,9 +2114,6 @@ def show_platform_control_centre(
         )
 
 
-# =========================================================
-# MAIN APPLICATION
-# =========================================================
 def show_app():
     client = get_authed_client()
 
@@ -2247,9 +2142,6 @@ def show_app():
 
         st.rerun()
 
-    # -----------------------------------------------------
-    # SESSION VALIDATION
-    # -----------------------------------------------------
     try:
         verified = (
             client.auth.get_user(
@@ -2322,9 +2214,6 @@ def show_app():
             )
             st.stop()
 
-    # -----------------------------------------------------
-    # SIDEBAR
-    # -----------------------------------------------------
     st.sidebar.title(
         "🚚 Gonnie Fleet Intelligence"
     )
@@ -2406,9 +2295,6 @@ def show_app():
         nav
     )
 
-    # -----------------------------------------------------
-    # MASTER PAGES
-    # -----------------------------------------------------
     if (
         app_mode
         == "👑 Gonnie Platform Control Centre"
@@ -2434,9 +2320,6 @@ def show_app():
 
         return
 
-    # -----------------------------------------------------
-    # DATA
-    # -----------------------------------------------------
     trips_df = fetch_df(
         client,
         "trips",
@@ -2455,9 +2338,6 @@ def show_app():
         tenant_filter
     )
 
-    # =====================================================
-    # EXECUTIVE DASHBOARD
-    # =====================================================
     if app_mode == "📊 Executive Dashboard":
         st.title(
             "📊 Fleet Executive Dashboard"
@@ -2582,9 +2462,6 @@ def show_app():
 
             st.markdown("---")
 
-            # ---------------------------------------------
-            # VEHICLE PERFORMANCE
-            # ---------------------------------------------
             if "registration" in trips_df.columns:
                 st.subheader(
                     "🚛 Vehicle Performance"
@@ -2647,12 +2524,9 @@ def show_app():
 
                     st.dataframe(
                         perf,
-                        use_container_width=True
+                        width="stretch"
                     )
 
-            # ---------------------------------------------
-            # DRIVER PERFORMANCE
-            # ---------------------------------------------
             if (
                 "driver_name"
                 in trips_df.columns
@@ -2709,12 +2583,9 @@ def show_app():
 
                     st.dataframe(
                         perf,
-                        use_container_width=True
+                        width="stretch"
                     )
 
-            # ---------------------------------------------
-            # MONTHLY
-            # ---------------------------------------------
             if (
                 "trip_date"
                 in trips_df.columns
@@ -2778,9 +2649,6 @@ def show_app():
                             monthly
                         )
 
-    # =====================================================
-    # TRIP LOG
-    # =====================================================
     elif app_mode == "🗺️ Trip Log":
         st.title(
             "🚚 GONNIE FLEET — TRIP LOG"
@@ -3211,7 +3079,7 @@ def show_app():
         if not trips_df.empty:
             st.dataframe(
                 trips_df,
-                use_container_width=True
+                width="stretch"
             )
 
             can_delete = (
@@ -3291,9 +3159,6 @@ def show_app():
                             f"Could not delete trip: {e}"
                         )
 
-    # =====================================================
-    # VEHICLE REGISTER
-    # =====================================================
     elif app_mode == "🚗 Vehicle Register":
         st.title(
             "🚗 VEHICLE REGISTER"
@@ -3494,7 +3359,7 @@ def show_app():
         if not vehicles_df.empty:
             st.dataframe(
                 vehicles_df,
-                use_container_width=True
+                width="stretch"
             )
 
             can_delete = (
@@ -3572,9 +3437,6 @@ def show_app():
                             f"Could not delete vehicle: {e}"
                         )
 
-    # =====================================================
-    # DRIVER REGISTER
-    # =====================================================
     elif app_mode == "👤 Driver Register":
         st.title(
             "👤 DRIVER REGISTER"
@@ -3740,7 +3602,7 @@ def show_app():
         if not drivers_df.empty:
             st.dataframe(
                 drivers_df,
-                use_container_width=True
+                width="stretch"
             )
 
             can_delete = (
@@ -3818,9 +3680,6 @@ def show_app():
                             f"Could not delete driver: {e}"
                         )
 
-    # =====================================================
-    # COMPLIANCE
-    # =====================================================
     elif app_mode == "📅 Compliance & Documents":
         st.title(
             "📅 COMPLIANCE & DOCUMENT TRACKER"
@@ -3913,12 +3772,9 @@ def show_app():
 
             st.dataframe(
                 pd.DataFrame(rows),
-                use_container_width=True
+                width="stretch"
             )
 
-    # =====================================================
-    # FUEL ANALYSIS
-    # =====================================================
     elif app_mode == "⛽ Fuel Consumption Analysis":
         st.title(
             "⛽ FUEL CONSUMPTION ANALYSIS"
@@ -4009,7 +3865,7 @@ def show_app():
 
             st.dataframe(
                 monthly,
-                use_container_width=True
+                width="stretch"
             )
 
             chart_df = monthly.set_index(
@@ -4090,12 +3946,9 @@ def show_app():
 
                 st.dataframe(
                     alerts,
-                    use_container_width=True
+                    width="stretch"
                 )
 
-    # =====================================================
-    # MAINTENANCE
-    # =====================================================
     elif app_mode == "🔧 Maintenance Log":
         st.title(
             "🔧 MAINTENANCE LOG"
@@ -4274,7 +4127,7 @@ def show_app():
         if not maint_df.empty:
             st.dataframe(
                 maint_df,
-                use_container_width=True
+                width="stretch"
             )
 
         else:
@@ -4282,9 +4135,6 @@ def show_app():
                 "No maintenance events logged yet."
             )
 
-    # =====================================================
-    # FINANCIAL FORECAST
-    # =====================================================
     elif app_mode == "💰 Financial Forecast":
         st.title(
             "💰 FINANCIAL FORECAST"
@@ -4430,16 +4280,13 @@ def show_app():
         if rows:
             st.dataframe(
                 pd.DataFrame(rows),
-                use_container_width=True
+                width="stretch"
             )
         else:
             st.success(
                 "No upcoming events."
             )
 
-    # =====================================================
-    # JOB PROFITABILITY
-    # =====================================================
     elif app_mode == "🧮 Job Profitability Estimator":
         st.title(
             "🧮 JOB PROFITABILITY ESTIMATOR"
@@ -4596,9 +4443,6 @@ def show_app():
                 "❌ DO NOT TAKE"
             )
 
-    # =====================================================
-    # GPS TRACKER
-    # =====================================================
     elif app_mode == "🛰️ GPS Tracker Log":
         st.title(
             "🛰️ GPS TRACKER LOG"
@@ -4835,7 +4679,7 @@ def show_app():
 
             st.dataframe(
                 gps,
-                use_container_width=True
+                width="stretch"
             )
 
         else:
@@ -4843,9 +4687,6 @@ def show_app():
                 "No GPS records yet."
             )
 
-    # =====================================================
-    # BILLING
-    # =====================================================
     elif app_mode == "💳 Billing & Subscription":
         st.title(
             "💳 BILLING & SUBSCRIPTION"
@@ -5011,9 +4852,6 @@ def show_app():
                                 "amount_cents"
                             ] = amount
 
-                        # IMPORTANT:
-                        # Publishable key goes in apikey.
-                        # User JWT goes in Authorization.
                         resp = requests.post(
                             CHECKOUT_FUNCTION_URL,
 
@@ -5094,9 +4932,6 @@ def show_app():
                             f"Checkout request failed: {e}"
                         )
 
-            # -------------------------------------------------
-            # HISTORY
-            # -------------------------------------------------
             try:
                 hist = (
                     client.table(
@@ -5146,7 +4981,7 @@ def show_app():
 
                     st.dataframe(
                         hist_df,
-                        use_container_width=True
+                        width="stretch"
                     )
 
             except Exception as e:
@@ -5155,9 +4990,6 @@ def show_app():
                 )
 
 
-# =========================================================
-# ENTRYPOINT
-# =========================================================
 if "session" not in st.session_state:
     show_login()
 else:
