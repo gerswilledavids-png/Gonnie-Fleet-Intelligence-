@@ -506,6 +506,118 @@ def write_audit(
         pass
 
 
+def update_scoped_record(
+    client,
+    user,
+    profile,
+    table_name,
+    record_id,
+    fields,
+    tenant_id=None
+):
+    """Safely update a record that belongs to a tenant-scoped table.
+
+    Mirrors delete_scoped_record's safety checks: confirms the record
+    exists (and is visible under RLS / the given tenant scope), applies
+    the update scoped to that tenant, verifies the change stuck, and
+    writes an audit log entry with before/after data.
+    """
+    if not record_id:
+        raise ValueError(
+            "A record ID is required."
+        )
+
+    is_master = (
+        profile.get("role")
+        == "master_admin"
+    )
+
+    if (
+        not is_master
+        and not profile.get("tenant_id")
+    ):
+        raise PermissionError(
+            "No tenant is assigned to this user."
+        )
+
+    effective_tenant = (
+        tenant_id
+        if is_master
+        else profile.get("tenant_id")
+    )
+
+    lookup = (
+        client.table(table_name)
+        .select("*")
+        .eq("id", record_id)
+        .limit(1)
+    )
+
+    if effective_tenant:
+        lookup = lookup.eq(
+            "tenant_id",
+            effective_tenant
+        )
+
+    rows = lookup.execute().data or []
+
+    if not rows:
+        raise RuntimeError(
+            "The record no longer exists, "
+            "belongs to another tenant, "
+            "or RLS blocked access."
+        )
+
+    old = rows[0]
+
+    # Never let an edit form silently move a record to another tenant.
+    safe_fields = {
+        k: v
+        for k, v in fields.items()
+        if k not in ("id", "tenant_id")
+    }
+
+    update_query = (
+        client.table(table_name)
+        .update(safe_fields)
+        .eq("id", record_id)
+    )
+
+    if effective_tenant:
+        update_query = update_query.eq(
+            "tenant_id",
+            effective_tenant
+        )
+
+    result = update_query.execute()
+
+    updated_rows = result.data or []
+
+    if not updated_rows:
+        raise RuntimeError(
+            "The record was not updated. "
+            "RLS or database permissions may have blocked the operation."
+        )
+
+    new = updated_rows[0]
+
+    write_audit(
+        client,
+        user,
+        profile,
+        "UPDATE",
+        table_name,
+        record_id,
+        old.get("tenant_id")
+        if isinstance(old, dict)
+        else effective_tenant,
+        old,
+        new
+    )
+
+    return new
+
+
 def delete_scoped_record(
     client,
     user,
@@ -3101,6 +3213,542 @@ def show_app():
                 st.markdown("---")
 
                 st.subheader(
+                    "✏️ Edit Trip"
+                )
+
+                edit_options = {}
+
+                for _, r in trips_df.iterrows():
+                    edit_options[
+                        f"{r.get('trip_id','')} "
+                        f"• {r.get('trip_date','')} "
+                        f"• {r.get('registration','')}"
+                    ] = r["id"]
+
+                edit_selected = st.selectbox(
+                    "Trip",
+                    list(edit_options.keys()),
+                    key="edit_trip_select"
+                )
+
+                edit_id = edit_options[edit_selected]
+
+                edit_matches = trips_df[
+                    trips_df["id"] == edit_id
+                ]
+
+                if not edit_matches.empty:
+                    er = edit_matches.iloc[0]
+
+                    with st.form(
+                        "edit_trip_form"
+                    ):
+                        c1, c2, c3 = st.columns(3)
+
+                        e_trip_id = c1.text_input(
+                            "Trip ID",
+                            value=str(
+                                er.get("trip_id") or ""
+                            )
+                        )
+
+                        e_fleet_no = c2.text_input(
+                            "Fleet No",
+                            value=str(
+                                er.get("fleet_no") or ""
+                            )
+                        )
+
+                        reg_choices = (
+                            list(veh_lookup.keys())
+                            or [
+                                str(
+                                    er.get("registration")
+                                    or ""
+                                )
+                            ]
+                        )
+
+                        current_reg = str(
+                            er.get("registration") or ""
+                        )
+
+                        if current_reg not in reg_choices:
+                            reg_choices = (
+                                [current_reg] + reg_choices
+                            )
+
+                        e_registration = c3.selectbox(
+                            "Registration",
+                            reg_choices,
+                            index=reg_choices.index(
+                                current_reg
+                            )
+                        )
+
+                        c4, c5, c6 = st.columns(3)
+
+                        if (
+                            not drivers_df.empty
+                            and "driver_name"
+                            in drivers_df.columns
+                        ):
+                            driver_choices = list(
+                                drivers_df["driver_name"]
+                            )
+                        else:
+                            driver_choices = []
+
+                        current_driver = str(
+                            er.get("driver_name") or ""
+                        )
+
+                        if (
+                            current_driver
+                            and current_driver
+                            not in driver_choices
+                        ):
+                            driver_choices = (
+                                [current_driver]
+                                + driver_choices
+                            )
+
+                        if not driver_choices:
+                            driver_choices = [
+                                current_driver
+                            ]
+
+                        e_driver_name = c4.selectbox(
+                            "Driver Name",
+                            driver_choices,
+                            index=driver_choices.index(
+                                current_driver
+                            )
+                            if current_driver
+                            in driver_choices
+                            else 0
+                        )
+
+                        e_driver_phone = c5.text_input(
+                            "Driver Phone",
+                            value=str(
+                                er.get("driver_phone") or ""
+                            )
+                        )
+
+                        try:
+                            default_trip_date = (
+                                pd.to_datetime(
+                                    er.get("trip_date")
+                                ).date()
+                            )
+                        except Exception:
+                            default_trip_date = date.today()
+
+                        e_trip_date = c6.date_input(
+                            "Trip Date",
+                            value=default_trip_date
+                        )
+
+                        c7, c8 = st.columns(2)
+
+                        e_origin = c7.text_input(
+                            "Destination Start",
+                            value=str(
+                                er.get("origin")
+                                or "D.O.W DEPOT"
+                            )
+                        )
+
+                        e_destination = c8.text_input(
+                            "Destination End",
+                            value=str(
+                                er.get("destination") or ""
+                            )
+                        )
+
+                        c9, c10, c11 = st.columns(3)
+
+                        e_odo_start = c9.number_input(
+                            "Odo Start",
+                            min_value=0.0,
+                            value=numeric_value(
+                                er.get("odo_start")
+                            )
+                        )
+
+                        e_odo_end = c10.number_input(
+                            "Odo End",
+                            min_value=0.0,
+                            value=numeric_value(
+                                er.get("odo_end")
+                            )
+                        )
+
+                        e_distance_km = c11.number_input(
+                            "Distance KM",
+                            min_value=0.0,
+                            value=numeric_value(
+                                er.get("distance_km")
+                            )
+                        )
+
+                        c12, c13 = st.columns(2)
+
+                        e_fuel_used = c12.number_input(
+                            "Fuel Used (L)",
+                            min_value=0.0,
+                            value=numeric_value(
+                                er.get("fuel_used_liters")
+                            )
+                        )
+
+                        e_price = c13.number_input(
+                            "Cost/Litre (R)",
+                            min_value=0.0,
+                            value=numeric_value(
+                                er.get("cost_per_liter"),
+                                25.31
+                            )
+                        )
+
+                        c14, c15, c16 = st.columns(3)
+
+                        e_revenue = c14.number_input(
+                            "Revenue (R)",
+                            min_value=0.0,
+                            value=numeric_value(
+                                er.get("revenue")
+                            )
+                        )
+
+                        e_fixed_cost = c15.number_input(
+                            "Fixed Cost (R)",
+                            min_value=0.0,
+                            value=numeric_value(
+                                er.get("fixed_cost")
+                            )
+                        )
+
+                        e_auto_variable_cost = (
+                            c16.checkbox(
+                                "Auto-calculate Variable Cost from fuel",
+                                value=False,
+                                key="edit_trip_auto_variable"
+                            )
+                        )
+
+                        e_variable_cost = c16.number_input(
+                            "Variable Cost (R)",
+                            min_value=0.0,
+                            value=numeric_value(
+                                er.get("variable_cost")
+                            ),
+                            disabled=e_auto_variable_cost,
+                            key="edit_trip_variable_cost"
+                        )
+
+                        c17, c18, c19 = st.columns(3)
+
+                        e_customer = c17.text_input(
+                            "Customer",
+                            value=str(
+                                er.get("customer_name") or ""
+                            )
+                        )
+
+                        e_cargo = c18.text_input(
+                            "Cargo Type",
+                            value=str(
+                                er.get("cargo_type") or ""
+                            )
+                        )
+
+                        e_load_kg = c19.number_input(
+                            "Load KG",
+                            min_value=0.0,
+                            value=numeric_value(
+                                er.get("load_kg")
+                            )
+                        )
+
+                        c20, c21, c22 = st.columns(3)
+
+                        e_station = c20.text_input(
+                            "Fuel Station",
+                            value=str(
+                                er.get("fuel_station") or ""
+                            )
+                        )
+
+                        e_gps = c21.checkbox(
+                            "GPS Verified",
+                            value=bool(
+                                er.get("gps_verified")
+                            )
+                        )
+
+                        e_score = c22.number_input(
+                            "Driver Score",
+                            min_value=0.0,
+                            max_value=100.0,
+                            value=numeric_value(
+                                er.get("driver_score"),
+                                95.0
+                            )
+                        )
+
+                        c23, c24 = st.columns(2)
+
+                        maint_options = [
+                            "None",
+                            "SERVICE DUE",
+                            "OVERDUE"
+                        ]
+
+                        current_maint = str(
+                            er.get("maint_flag")
+                            or "None"
+                        )
+
+                        e_maint = c23.selectbox(
+                            "Maint Flag",
+                            maint_options,
+                            index=maint_options.index(
+                                current_maint
+                            )
+                            if current_maint
+                            in maint_options
+                            else 0
+                        )
+
+                        paid_options = [
+                            "unpaid",
+                            "paid"
+                        ]
+
+                        current_paid = str(
+                            er.get("paid_status")
+                            or "unpaid"
+                        )
+
+                        e_paid = c24.selectbox(
+                            "Paid Status",
+                            paid_options,
+                            index=paid_options.index(
+                                current_paid
+                            )
+                            if current_paid
+                            in paid_options
+                            else 0
+                        )
+
+                        e_manager = st.text_input(
+                            "Manager Name",
+                            value=str(
+                                er.get("manager_name") or ""
+                            )
+                        )
+
+                        e_manager_phone = st.text_input(
+                            "Manager Phone",
+                            value=str(
+                                er.get("manager_phone") or ""
+                            )
+                        )
+
+                        e_notes = st.text_area(
+                            "Trip Notes",
+                            value=str(
+                                er.get("trip_notes") or ""
+                            )
+                        )
+
+                        if st.form_submit_button(
+                            "💾 Save Trip Changes"
+                        ):
+                            if (
+                                e_odo_end > 0
+                                and e_odo_start > 0
+                                and e_odo_end < e_odo_start
+                            ):
+                                st.error(
+                                    "Odo End is less than Odo Start — "
+                                    "check the readings before saving."
+                                )
+
+                            else:
+                                auto_distance = (
+                                    e_odo_end - e_odo_start
+                                    if e_odo_end > e_odo_start
+                                    else e_distance_km
+                                )
+
+                                resolved_variable_cost = (
+                                    e_fuel_used * e_price
+                                    if e_auto_variable_cost
+                                    else e_variable_cost
+                                )
+
+                                calc = compute_trip_fields(
+                                    {
+                                        "distance_km":
+                                            auto_distance,
+
+                                        "fuel_used_liters":
+                                            e_fuel_used,
+
+                                        "cost_per_liter":
+                                            e_price,
+
+                                        "revenue":
+                                            e_revenue,
+
+                                        "fixed_cost":
+                                            e_fixed_cost,
+
+                                        "variable_cost":
+                                            resolved_variable_cost,
+                                    },
+                                    veh_lookup.get(
+                                        e_registration
+                                    )
+                                )
+
+                                fields = {
+                                    "trip_id":
+                                        e_trip_id,
+
+                                    "fleet_no":
+                                        e_fleet_no,
+
+                                    "registration":
+                                        e_registration,
+
+                                    "driver_name":
+                                        e_driver_name,
+
+                                    "driver_phone":
+                                        e_driver_phone,
+
+                                    "trip_date":
+                                        str(e_trip_date),
+
+                                    "origin":
+                                        e_origin,
+
+                                    "destination":
+                                        e_destination,
+
+                                    "odo_start":
+                                        e_odo_start,
+
+                                    "odo_end":
+                                        e_odo_end,
+
+                                    "distance_km":
+                                        auto_distance,
+
+                                    "fuel_used_liters":
+                                        e_fuel_used,
+
+                                    "cost_per_liter":
+                                        e_price,
+
+                                    "revenue":
+                                        e_revenue,
+
+                                    "fixed_cost":
+                                        e_fixed_cost,
+
+                                    "variable_cost":
+                                        resolved_variable_cost,
+
+                                    "net_profit":
+                                        calc["net_profit"],
+
+                                    "customer_name":
+                                        e_customer,
+
+                                    "cargo_type":
+                                        e_cargo,
+
+                                    "load_kg":
+                                        e_load_kg,
+
+                                    "fuel_station":
+                                        e_station,
+
+                                    "gps_verified":
+                                        e_gps,
+
+                                    "driver_score":
+                                        e_score,
+
+                                    "maint_flag":
+                                        e_maint,
+
+                                    "paid_status":
+                                        e_paid,
+
+                                    "manager_name":
+                                        e_manager,
+
+                                    "manager_phone":
+                                        e_manager_phone,
+
+                                    "trip_notes":
+                                        e_notes,
+                                }
+
+                                try:
+                                    update_scoped_record(
+                                        client,
+                                        user,
+                                        profile,
+                                        "trips",
+                                        edit_id,
+                                        fields,
+                                        (
+                                            tenant_filter
+                                            if is_master
+                                            and tenant_filter
+                                            else None
+                                        )
+                                    )
+
+                                    if calc[
+                                        "theft_alert"
+                                    ]:
+                                        st.warning(
+                                            "🚨 Theft Alert: "
+                                            f"KM/L is "
+                                            f"{calc['fuel_variance_pct']}% "
+                                            "below expected."
+                                        )
+
+                                    st.success(
+                                        f"Trip updated. "
+                                        f"KM/L {calc['km_per_l']} "
+                                        f"| Profit "
+                                        f"R{calc['net_profit']:,.2f}"
+                                    )
+
+                                    st.rerun()
+
+                                except Exception as e:
+                                    st.error(
+                                        f"Could not update trip: {e}"
+                                    )
+
+            if (
+                can_delete
+                and "id"
+                in trips_df.columns
+            ):
+                st.markdown("---")
+
+                st.subheader(
                     "🗑️ Delete Trip"
                 )
 
@@ -3380,6 +4028,263 @@ def show_app():
                 st.markdown("---")
 
                 st.subheader(
+                    "✏️ Edit Vehicle"
+                )
+
+                edit_options = {
+                    f"{r.get('registration','')} "
+                    f"• Fleet {r.get('fleet_no','')} "
+                    f"• {r.get('make','')} "
+                    f"{r.get('model','')}":
+                        r["id"]
+                    for _, r
+                    in vehicles_df.iterrows()
+                }
+
+                edit_selected = st.selectbox(
+                    "Vehicle",
+                    list(edit_options.keys()),
+                    key="edit_vehicle_select"
+                )
+
+                edit_id = edit_options[
+                    edit_selected
+                ]
+
+                edit_matches = vehicles_df[
+                    vehicles_df["id"] == edit_id
+                ]
+
+                if not edit_matches.empty:
+                    er = edit_matches.iloc[0]
+
+                    status_options = [
+                        "Active",
+                        "In Maintenance",
+                        "Inactive"
+                    ]
+
+                    current_status = str(
+                        er.get("status")
+                        or "Active"
+                    )
+
+                    with st.form(
+                        "edit_vehicle_form"
+                    ):
+                        c1, c2, c3 = st.columns(3)
+
+                        e_registration = c1.text_input(
+                            "Registration",
+                            value=str(
+                                er.get("registration") or ""
+                            )
+                        )
+
+                        e_fleet_no = c2.text_input(
+                            "Fleet No",
+                            value=str(
+                                er.get("fleet_no") or ""
+                            )
+                        )
+
+                        e_make = c3.text_input(
+                            "Make",
+                            value=str(
+                                er.get("make") or ""
+                            )
+                        )
+
+                        c4, c5, c6 = st.columns(3)
+
+                        e_model = c4.text_input(
+                            "Model",
+                            value=str(
+                                er.get("model") or ""
+                            )
+                        )
+
+                        e_year = c5.number_input(
+                            "Year",
+                            min_value=1980,
+                            max_value=2100,
+                            value=int(
+                                numeric_value(
+                                    er.get("year"),
+                                    2020
+                                )
+                            )
+                        )
+
+                        e_vin = c6.text_input(
+                            "VIN / Engine No",
+                            value=str(
+                                er.get("vin_engine_no") or ""
+                            )
+                        )
+
+                        c7, c8, c9 = st.columns(3)
+
+                        e_status = c7.selectbox(
+                            "Status",
+                            status_options,
+                            index=status_options.index(
+                                current_status
+                            )
+                            if current_status
+                            in status_options
+                            else 0
+                        )
+
+                        e_expected = c8.number_input(
+                            "Expected KM/L",
+                            min_value=0.0,
+                            value=numeric_value(
+                                er.get("expected_km_l"),
+                                2.0
+                            )
+                        )
+
+                        e_service_cost = c9.number_input(
+                            "Service Cost/KM",
+                            min_value=0.0,
+                            value=numeric_value(
+                                er.get("service_cost_per_km"),
+                                1.0
+                            )
+                        )
+
+                        c10, c11, c12 = st.columns(3)
+
+                        e_insurance = c10.number_input(
+                            "Monthly Insurance (R)",
+                            min_value=0.0,
+                            value=numeric_value(
+                                er.get("monthly_insurance")
+                            )
+                        )
+
+                        e_next_service = c11.number_input(
+                            "Next Service KM",
+                            min_value=0.0,
+                            value=numeric_value(
+                                er.get("next_service_km")
+                            )
+                        )
+
+                        e_avg_daily = c12.number_input(
+                            "Avg Daily KM",
+                            min_value=0.0,
+                            value=numeric_value(
+                                er.get("avg_daily_km")
+                            )
+                        )
+
+                        c13, c14 = st.columns(2)
+
+                        e_odo = c13.number_input(
+                            "Current Odometer",
+                            min_value=0.0,
+                            value=numeric_value(
+                                er.get("current_odometer")
+                            )
+                        )
+
+                        e_license_cost = c14.number_input(
+                            "Annual License Cost",
+                            min_value=0.0,
+                            value=numeric_value(
+                                er.get("annual_license_cost")
+                            )
+                        )
+
+                        if st.form_submit_button(
+                            "💾 Save Vehicle Changes"
+                        ):
+                            if not e_registration.strip():
+                                st.error(
+                                    "Registration is required."
+                                )
+                            else:
+                                fields = {
+                                    "registration":
+                                        e_registration.strip(),
+
+                                    "fleet_no":
+                                        e_fleet_no,
+
+                                    "make":
+                                        e_make,
+
+                                    "model":
+                                        e_model,
+
+                                    "year":
+                                        int(e_year),
+
+                                    "vin_engine_no":
+                                        e_vin,
+
+                                    "status":
+                                        e_status,
+
+                                    "expected_km_l":
+                                        e_expected,
+
+                                    "service_cost_per_km":
+                                        e_service_cost,
+
+                                    "monthly_insurance":
+                                        e_insurance,
+
+                                    "next_service_km":
+                                        e_next_service,
+
+                                    "avg_daily_km":
+                                        e_avg_daily,
+
+                                    "current_odometer":
+                                        e_odo,
+
+                                    "annual_license_cost":
+                                        e_license_cost,
+                                }
+
+                                try:
+                                    update_scoped_record(
+                                        client,
+                                        user,
+                                        profile,
+                                        "vehicles",
+                                        edit_id,
+                                        fields,
+                                        (
+                                            tenant_filter
+                                            if is_master
+                                            and tenant_filter
+                                            else None
+                                        )
+                                    )
+
+                                    st.success(
+                                        "Vehicle updated."
+                                    )
+
+                                    st.rerun()
+
+                                except Exception as e:
+                                    st.error(
+                                        f"Could not update vehicle: {e}"
+                                    )
+
+            if (
+                can_delete
+                and "id"
+                in vehicles_df.columns
+            ):
+                st.markdown("---")
+
+                st.subheader(
                     "🗑️ Delete Vehicle"
                 )
 
@@ -3623,10 +4528,10 @@ def show_app():
                 st.markdown("---")
 
                 st.subheader(
-                    "🗑️ Delete Driver"
+                    "✏️ Edit Driver"
                 )
 
-                options = {
+                edit_options = {
                     f"{r.get('driver_name','')} "
                     f"• {r.get('driver_phone','')} "
                     f"• License "
@@ -3636,1361 +4541,228 @@ def show_app():
                     in drivers_df.iterrows()
                 }
 
-                selected = st.selectbox(
+                edit_selected = st.selectbox(
                     "Driver",
-                    list(options.keys()),
-                    key="delete_driver_select"
+                    list(edit_options.keys()),
+                    key="edit_driver_select"
                 )
 
-                confirm = st.checkbox(
-                    "I understand this permanently deletes the selected driver.",
-                    key="delete_driver_confirm"
-                )
-
-                if st.button(
-                    "🗑️ Delete Selected Driver",
-                    disabled=not confirm,
-                    key="delete_driver_button"
-                ):
-                    try:
-                        old = delete_scoped_record(
-                            client,
-                            user,
-                            profile,
-                            "drivers",
-                            options[selected],
-                            (
-                                tenant_filter
-                                if is_master
-                                and tenant_filter
-                                else None
-                            )
-                        )
-
-                        st.success(
-                            f"Driver "
-                            f"{old.get('driver_name','')} "
-                            "deleted."
-                        )
-
-                        st.rerun()
-
-                    except Exception as e:
-                        st.error(
-                            f"Could not delete driver: {e}"
-                        )
-
-    elif app_mode == "📅 Compliance & Documents":
-        st.title(
-            "📅 COMPLIANCE & DOCUMENT TRACKER"
-        )
-
-        if drivers_df.empty:
-            st.info(
-                "Add drivers to populate compliance tracking."
-            )
-
-        else:
-            rows = []
-
-            for _, d in drivers_df.iterrows():
-                ls, ld = compliance_status(
-                    d.get(
-                        "license_expiry"
-                    )
-                )
-
-                ps, pdays = compliance_status(
-                    d.get(
-                        "prdp_expiry"
-                    )
-                )
-
-                vals = [
-                    x
-                    for x in (
-                        ld,
-                        pdays
-                    )
-                    if x is not None
+                edit_id = edit_options[
+                    edit_selected
                 ]
 
-                worst = (
-                    min(vals)
-                    if vals
-                    else None
-                )
-
-                action = (
-                    "No action needed"
-                )
-
-                if (
-                    worst is not None
-                    and worst <= 7
-                ):
-                    action = (
-                        "Renew immediately"
-                    )
-
-                elif (
-                    worst is not None
-                    and worst <= 30
-                ):
-                    action = (
-                        "Schedule renewal"
-                    )
-
-                rows.append({
-                    "Driver Name":
-                        d.get(
-                            "driver_name"
-                        ),
-
-                    "License Expiry":
-                        d.get(
-                            "license_expiry"
-                        ),
-
-                    "License Status":
-                        ls,
-
-                    "PrDP Expiry":
-                        d.get(
-                            "prdp_expiry"
-                        ),
-
-                    "PrDP Status":
-                        ps,
-
-                    "Days to Expiry":
-                        worst,
-
-                    "Action Required":
-                        action,
-                })
-
-            st.dataframe(
-                pd.DataFrame(rows),
-                width="stretch"
-            )
-
-    elif app_mode == "⛽ Fuel Consumption Analysis":
-        st.title(
-            "⛽ FUEL CONSUMPTION ANALYSIS"
-        )
-
-        if trips_df.empty:
-            st.info(
-                "No fuel data yet."
-            )
-
-        else:
-            df = trips_df.copy()
-
-            required = [
-                "trip_date",
-                "fuel_used_liters",
-                "cost_per_liter",
-                "distance_km"
-            ]
-
-            for col in required:
-                if col not in df.columns:
-                    df[col] = 0
-
-            df["fuel_used_liters"] = numeric_series(
-                df,
-                "fuel_used_liters"
-            )
-
-            df["cost_per_liter"] = numeric_series(
-                df,
-                "cost_per_liter"
-            )
-
-            df["distance_km"] = numeric_series(
-                df,
-                "distance_km"
-            )
-
-            df["_month"] = (
-                pd.to_datetime(
-                    df["trip_date"],
-                    errors="coerce"
-                )
-                .dt.to_period("M")
-                .astype(str)
-            )
-
-            df["fuel_cost"] = (
-                df["fuel_used_liters"]
-                * df["cost_per_liter"]
-            )
-
-            monthly = (
-                df.groupby("_month")
-                .agg(
-                    Total_Trips=(
-                        "trip_date",
-                        "count"
-                    ),
-
-                    Total_KM=(
-                        "distance_km",
-                        "sum"
-                    ),
-
-                    Total_Fuel_L=(
-                        "fuel_used_liters",
-                        "sum"
-                    ),
-
-                    Total_Cost_R=(
-                        "fuel_cost",
-                        "sum"
-                    ),
-                )
-                .reset_index()
-            )
-
-            monthly["Avg_KM_L"] = np.where(
-                monthly["Total_Fuel_L"] > 0,
-                (
-                    monthly["Total_KM"]
-                    / monthly["Total_Fuel_L"]
-                ).round(2),
-                0
-            )
-
-            st.dataframe(
-                monthly,
-                width="stretch"
-            )
-
-            chart_df = monthly.set_index(
-                "_month"
-            )[[
-                "Total_Cost_R",
-                "Avg_KM_L"
-            ]]
-
-            st.line_chart(
-                chart_df
-            )
-
-            if (
-                not vehicles_df.empty
-                and "registration"
-                in vehicles_df.columns
-            ):
-                lookup = {
-                    v["registration"]:
-                        numeric_value(
-                            v.get(
-                                "expected_km_l",
-                                2.0
-                            ),
-                            2.0
-                        )
-                    for _, v
-                    in vehicles_df.iterrows()
-                }
-
-            else:
-                lookup = {}
-
-            if "registration" not in df.columns:
-                df["registration"] = ""
-
-            df["expected_km_l"] = (
-                df["registration"]
-                .map(lookup)
-                .fillna(2.0)
-            )
-
-            df["actual_km_l"] = np.where(
-                df["fuel_used_liters"] > 0,
-                (
-                    df["distance_km"]
-                    / df["fuel_used_liters"]
-                ),
-                0
-            )
-
-            df["variance_pct"] = (
-                (
-                    (
-                        df["actual_km_l"]
-                        - df["expected_km_l"]
-                    )
-                    / df["expected_km_l"]
-                )
-                * 100
-            ).round(1)
-
-            alerts = df[
-                df["variance_pct"] <= -20
-            ]
-
-            if alerts.empty:
-                st.success(
-                    "No theft alerts."
-                )
-
-            else:
-                st.warning(
-                    f"🚨 {len(alerts)} "
-                    "fuel-efficiency alerts detected."
-                )
-
-                st.dataframe(
-                    alerts,
-                    width="stretch"
-                )
-
-    elif app_mode == "🔧 Maintenance Log":
-        st.title(
-            "🔧 MAINTENANCE LOG"
-        )
-
-        if (
-            not vehicles_df.empty
-            and "registration"
-            in vehicles_df.columns
-        ):
-            options = list(
-                vehicles_df[
-                    "registration"
+                edit_matches = drivers_df[
+                    drivers_df["id"] == edit_id
                 ]
-            )
-        else:
-            options = [
-                "(add vehicle first)"
-            ]
 
-        with st.expander(
-            "➕ Log a service event"
-        ):
-            with st.form(
-                "new_maintenance"
-            ):
-                c1, c2 = st.columns(2)
+                if not edit_matches.empty:
+                    er = edit_matches.iloc[0]
 
-                service_date = c1.date_input(
-                    "Service Date"
-                )
-
-                registration = c2.selectbox(
-                    "Registration",
-                    options
-                )
-
-                c3, c4 = st.columns(2)
-
-                fleet_no = c3.text_input(
-                    "Fleet No"
-                )
-
-                service_type = c4.selectbox(
-                    "Service Type",
-                    [
-                        "Scheduled",
-                        "Unscheduled"
+                    status_options = [
+                        "active",
+                        "inactive",
+                        "suspended"
                     ]
-                )
 
-                c5, c6 = st.columns(2)
+                    current_status = str(
+                        er.get("status")
+                        or "active"
+                    ).lower()
 
-                odo_service = c5.number_input(
-                    "Odo at Service",
-                    min_value=0.0
-                )
+                    if current_status not in status_options:
+                        status_options = (
+                            [current_status]
+                            + status_options
+                        )
 
-                next_service = c6.number_input(
-                    "Next Service KM",
-                    min_value=0.0
-                )
+                    try:
+                        default_license_expiry = (
+                            pd.to_datetime(
+                                er.get("license_expiry")
+                            ).date()
+                        )
+                    except Exception:
+                        default_license_expiry = date.today()
 
-                c7, c8 = st.columns(2)
+                    try:
+                        default_prdp_expiry = (
+                            pd.to_datetime(
+                                er.get("prdp_expiry")
+                            ).date()
+                        )
+                    except Exception:
+                        default_prdp_expiry = date.today()
 
-                cost = c7.number_input(
-                    "Cost (R)",
-                    min_value=0.0
-                )
-
-                workshop = c8.text_input(
-                    "Workshop"
-                )
-
-                notes = st.text_area(
-                    "Notes"
-                )
-
-                if st.form_submit_button(
-                    "Save Service Event"
-                ):
-                    if (
-                        registration
-                        == "(add vehicle first)"
+                    with st.form(
+                        "edit_driver_form"
                     ):
-                        st.error(
-                            "Add a vehicle first."
+                        c1, c2, c3 = st.columns(3)
+
+                        e_name = c1.text_input(
+                            "Driver Name",
+                            value=str(
+                                er.get("driver_name") or ""
+                            )
                         )
-                    else:
-                        payload = {
-                            "service_date":
-                                str(
-                                    service_date
-                                ),
 
-                            "registration":
-                                registration,
-
-                            "fleet_no":
-                                fleet_no,
-
-                            "service_type":
-                                service_type,
-
-                            "odo_at_service":
-                                odo_service,
-
-                            "next_service_km":
-                                next_service,
-
-                            "cost":
-                                cost,
-
-                            "workshop":
-                                workshop,
-
-                            "notes":
-                                notes,
-                        }
-
-                        try:
-                            payload = tenant_payload(
-                                payload,
-                                is_master,
-                                tenant_filter,
-                                profile
+                        e_phone = c2.text_input(
+                            "Phone",
+                            value=str(
+                                er.get("driver_phone") or ""
                             )
+                        )
 
-                            res = (
-                                client.table(
-                                    "maintenance_log"
+                        e_license_no = c3.text_input(
+                            "License No",
+                            value=str(
+                                er.get("license_number") or ""
+                            )
+                        )
+
+                        c4, c5 = st.columns(2)
+
+                        e_license_expiry = c4.date_input(
+                            "License Expiry",
+                            value=default_license_expiry
+                        )
+
+                        e_prdp_expiry = c5.date_input(
+                            "PrDP Expiry",
+                            value=default_prdp_expiry
+                        )
+
+                        c6, c7, c8 = st.columns(3)
+
+                        e_supervisor = c6.text_input(
+                            "Supervisor",
+                            value=str(
+                                er.get("supervisor") or ""
+                            )
+                        )
+
+                        e_rating = c7.number_input(
+                            "Supervisor Rating",
+                            1.0,
+                            5.0,
+                            value=numeric_value(
+                                er.get("rating"),
+                                5.0
+                            )
+                        )
+
+                        e_avg_score = c8.number_input(
+                            "Avg Driver Score",
+                            0.0,
+                            100.0,
+                            value=numeric_value(
+                                er.get("avg_driver_score"),
+                                100.0
+                            )
+                        )
+
+                        c9, c10, c11 = st.columns(3)
+
+                        e_accidents = c9.number_input(
+                            "Accidents",
+                            0,
+                            value=int(
+                                numeric_value(
+                                    er.get("accidents")
                                 )
-                                .insert(payload)
-                                .execute()
                             )
+                        )
 
-                            record = (
-                                res.data[0]
-                                if res.data
-                                else None
+                        e_fines = c10.number_input(
+                            "Fines",
+                            0,
+                            value=int(
+                                numeric_value(
+                                    er.get("fines")
+                                )
                             )
+                        )
 
-                            write_audit(
-                                client,
-                                user,
-                                profile,
-                                "CREATE",
-                                "maintenance_log",
-                                record.get("id")
-                                if record
-                                else None,
-                                payload.get(
-                                    "tenant_id"
-                                ),
-                                None,
-                                record
+                        e_status = c11.selectbox(
+                            "Status",
+                            status_options,
+                            index=status_options.index(
+                                current_status
                             )
+                        )
 
-                            st.success(
-                                "Service event logged."
-                            )
+                        if st.form_submit_button(
+                            "💾 Save Driver Changes"
+                        ):
+                            if not e_name.strip():
+                                st.error(
+                                    "Driver Name is required."
+                                )
+                            else:
+                                fields = {
+                                    "driver_name":
+                                        e_name.strip(),
 
-                            st.rerun()
+                                    "driver_phone":
+                                        e_phone,
 
-                        except Exception as e:
-                            st.error(
-                                f"Could not save: {e}"
-                            )
+                                    "license_number":
+                                        e_license_no,
 
-        maint_df = fetch_df(
-            client,
-            "maintenance_log",
-            tenant_filter
-        )
+                                    "license_expiry":
+                                        str(e_license_expiry),
 
-        if not maint_df.empty:
-            st.dataframe(
-                maint_df,
-                width="stretch"
-            )
+                                    "prdp_expiry":
+                                        str(e_prdp_expiry),
 
-        else:
-            st.info(
-                "No maintenance events logged yet."
-            )
+                                    "supervisor":
+                                        e_supervisor,
 
-    elif app_mode == "💰 Financial Forecast":
-        st.title(
-            "💰 FINANCIAL FORECAST"
-        )
+                                    "rating":
+                                        e_rating,
 
-        rows = []
+                                    "avg_driver_score":
+                                        e_avg_score,
 
-        total_spend = 0
-        urgent = 0
-        impacted = set()
+                                    "accidents":
+                                        int(e_accidents),
 
-        for _, v in vehicles_df.iterrows():
-            next_service = numeric_value(
-                v.get("next_service_km")
-            )
+                                    "fines":
+                                        int(e_fines),
 
-            avg = numeric_value(
-                v.get("avg_daily_km")
-            )
+                                    "status":
+                                        e_status,
+                                }
 
-            odo = numeric_value(
-                v.get("current_odometer")
-            )
+                                try:
+                                    update_scoped_record(
+                                        client,
+                                        user,
+                                        profile,
+                                        "drivers",
+                                        edit_id,
+                                        fields,
+                                        (
+                                            tenant_filter
+                                            if is_master
+                                            and tenant_filter
+                                            else None
+                                        )
+                                    )
+
+                                    st.success(
+                                        "Driver updated."
+                                    )
+
+                                    st.rerun()
+
+                                except Exception as e:
+                                    st.error(
+                                        f"Could not update driver: {e}"
+                                    )
 
             if (
-                next_service > 0
-                and avg > 0
-            ):
-                days = int(
-                    (
-                        next_service
-                        - odo
-                    )
-                    / avg
-                )
-
-                if days <= 30:
-                    rows.append({
-                        "Vehicle":
-                            v.get(
-                                "registration"
-                            ),
-
-                        "Event":
-                            "Service Due",
-
-                        "Days Away":
-                            days,
-
-                        "Priority":
-                            (
-                                "URGENT"
-                                if days <= 7
-                                else "PLAN"
-                            ),
-                    })
-
-                    if days <= 7:
-                        urgent += 1
-
-                    impacted.add(
-                        v.get(
-                            "registration"
-                        )
-                    )
-
-            total_spend += (
-                numeric_value(
-                    v.get(
-                        "annual_license_cost"
-                    )
-                )
-                / 12
-            )
-
-        for _, d in drivers_df.iterrows():
-            for field, label in [
-                (
-                    "license_expiry",
-                    "License Renewal"
-                ),
-                (
-                    "prdp_expiry",
-                    "PrDP Renewal"
-                ),
-            ]:
-                _, days = compliance_status(
-                    d.get(field)
-                )
-
-                if (
-                    days is not None
-                    and 0 <= days <= 30
-                ):
-                    rows.append({
-                        "Vehicle":
-                            "-",
-
-                        "Driver":
-                            d.get(
-                                "driver_name"
-                            ),
-
-                        "Event":
-                            label,
-
-                        "Days Away":
-                            days,
-
-                        "Priority":
-                            (
-                                "URGENT"
-                                if days <= 7
-                                else "PLAN"
-                            ),
-                    })
-
-                    if days <= 7:
-                        urgent += 1
-
-        c1, c2, c3, c4 = st.columns(4)
-
-        c1.metric(
-            "Forecast Spend",
-            f"R{total_spend:,.2f}"
-        )
-
-        c2.metric(
-            "Urgent Items",
-            urgent
-        )
-
-        c3.metric(
-            "Vehicles Impacted",
-            len(impacted)
-        )
-
-        c4.metric(
-            "Events",
-            len(rows)
-        )
-
-        if rows:
-            st.dataframe(
-                pd.DataFrame(rows),
-                width="stretch"
-            )
-        else:
-            st.success(
-                "No upcoming events."
-            )
-
-    elif app_mode == "🧮 Job Profitability Estimator":
-        st.title(
-            "🧮 JOB PROFITABILITY ESTIMATOR"
-        )
-
-        c1, c2 = st.columns(2)
-
-        distance = c1.number_input(
-            "Estimated Distance (km, one-way)",
-            1.0,
-            value=500.0
-        )
-
-        return_trip = c2.selectbox(
-            "Return Trip?",
-            [
-                "YES",
-                "NO"
-            ]
-        )
-
-        c3, c4 = st.columns(2)
-
-        revenue = c3.number_input(
-            "Revenue / Quote (R)",
-            0.0,
-            value=15000.0
-        )
-
-        fuel_price = c4.number_input(
-            "Fuel Cost per Litre (R)",
-            0.0,
-            value=25.31
-        )
-
-        c5, c6 = st.columns(2)
-
-        km_l = c5.number_input(
-            "Vehicle KM/L",
-            0.1,
-            value=2.0
-        )
-
-        driver_cost = c6.number_input(
-            "Driver Cost (R)",
-            0.0,
-            value=1500.0
-        )
-
-        c7, c8 = st.columns(2)
-
-        toll = c7.number_input(
-            "Toll Costs (R)",
-            0.0,
-            value=50.0
-        )
-
-        other = c8.number_input(
-            "Other Fixed Costs (R)",
-            0.0
-        )
-
-        c9, c10, c11 = st.columns(3)
-
-        maint = c9.number_input(
-            "Maintenance Alloc/KM",
-            0.0,
-            value=0.45
-        )
-
-        ins = c10.number_input(
-            "Insurance Alloc/KM",
-            0.0,
-            value=0.25
-        )
-
-        lic = c11.number_input(
-            "License Alloc/KM",
-            0.0,
-            value=0.022
-        )
-
-        mult = (
-            2
-            if return_trip == "YES"
-            else 1
-        )
-
-        total_km = (
-            distance * mult
-        )
-
-        fuel = (
-            total_km / km_l
-        )
-
-        fuel_cost = (
-            fuel * fuel_price
-        )
-
-        total_cost = (
-            fuel_cost
-            + driver_cost
-            + toll
-            + (
-                maint
-                + ins
-                + lic
-            )
-            * total_km
-            + other
-        )
-
-        profit = (
-            revenue
-            - total_cost
-        )
-
-        margin = (
-            profit
-            / revenue
-            * 100
-            if revenue
-            else 0
-        )
-
-        st.metric(
-            "Total Cost",
-            f"R{total_cost:,.2f}"
-        )
-
-        st.metric(
-            "Net Profit",
-            f"R{profit:,.2f}"
-        )
-
-        st.metric(
-            "Profit Margin",
-            f"{margin:.1f}%"
-        )
-
-        if margin >= 15:
-            st.success(
-                "✅ TAKE THE JOB"
-            )
-
-        elif margin >= 5:
-            st.warning(
-                "⚠️ MARGINAL"
-            )
-
-        else:
-            st.error(
-                "❌ DO NOT TAKE"
-            )
-
-    elif app_mode == "🛰️ GPS Tracker Log":
-        st.title(
-            "🛰️ GPS TRACKER LOG"
-        )
-
-        with st.expander(
-            "➕ Log a GPS trip record"
-        ):
-            with st.form(
-                "new_gps"
-            ):
-                c1, c2, c3 = st.columns(3)
-
-                log_date = c1.date_input(
-                    "Date"
-                )
-
-                registration = c2.text_input(
-                    "Registration"
-                )
-
-                fleet_no = c3.text_input(
-                    "Fleet No"
-                )
-
-                c4, c5 = st.columns(2)
-
-                driver = c4.text_input(
-                    "Driver Name"
-                )
-
-                location = c5.text_input(
-                    "Location (Lat, Long)"
-                )
-
-                c6, c7 = st.columns(2)
-
-                ignition_on = c6.time_input(
-                    "Ignition ON"
-                )
-
-                ignition_off = c7.time_input(
-                    "Ignition OFF"
-                )
-
-                c8, c9 = st.columns(2)
-
-                odo_start = c8.number_input(
-                    "Odo Start",
-                    0.0
-                )
-
-                odo_end = c9.number_input(
-                    "Odo End",
-                    0.0
-                )
-
-                c10, c11, c12 = st.columns(3)
-
-                idle = c10.number_input(
-                    "Idle Time (min)",
-                    0.0
-                )
-
-                fuel_start = c11.number_input(
-                    "Fuel Start (%)",
-                    0.0,
-                    100.0,
-                    100.0
-                )
-
-                fuel_end = c12.number_input(
-                    "Fuel End (%)",
-                    0.0,
-                    100.0,
-                    0.0
-                )
-
-                trip_distance = st.number_input(
-                    "Trip Log Distance",
-                    0.0
-                )
-
-                if st.form_submit_button(
-                    "Save GPS Record"
-                ):
-                    payload = {
-                        "log_date":
-                            str(log_date),
-
-                        "registration":
-                            registration,
-
-                        "fleet_no":
-                            fleet_no,
-
-                        "driver_name":
-                            driver,
-
-                        "ignition_on":
-                            str(ignition_on),
-
-                        "ignition_off":
-                            str(ignition_off),
-
-                        "odo_start":
-                            odo_start,
-
-                        "odo_end":
-                            odo_end,
-
-                        "idle_time_min":
-                            idle,
-
-                        "fuel_level_start":
-                            fuel_start,
-
-                        "fuel_level_end":
-                            fuel_end,
-
-                        "location":
-                            location,
-
-                        "trip_log_distance":
-                            trip_distance,
-                    }
-
-                    try:
-                        payload = tenant_payload(
-                            payload,
-                            is_master,
-                            tenant_filter,
-                            profile
-                        )
-
-                        res = (
-                            client.table(
-                                "gps_tracker_log"
-                            )
-                            .insert(payload)
-                            .execute()
-                        )
-
-                        record = (
-                            res.data[0]
-                            if res.data
-                            else None
-                        )
-
-                        write_audit(
-                            client,
-                            user,
-                            profile,
-                            "CREATE",
-                            "gps_tracker_log",
-                            record.get("id")
-                            if record
-                            else None,
-                            payload.get(
-                                "tenant_id"
-                            ),
-                            None,
-                            record
-                        )
-
-                        st.success(
-                            "GPS record saved."
-                        )
-
-                        st.rerun()
-
-                    except Exception as e:
-                        st.error(
-                            f"Could not save: {e}"
-                        )
-
-        gps = fetch_df(
-            client,
-            "gps_tracker_log",
-            tenant_filter
-        )
-
-        if not gps.empty:
-            for col in [
-                "odo_start",
-                "odo_end",
-                "trip_log_distance"
-            ]:
-                if col not in gps.columns:
-                    gps[col] = 0
-
-                gps[col] = numeric_series(
-                    gps,
-                    col
-                )
-
-            gps[
-                "gps_distance_km"
-            ] = (
-                gps["odo_end"]
-                - gps["odo_start"]
-            )
-
-            gps[
-                "variance_pct"
-            ] = np.where(
-                gps["trip_log_distance"] > 0,
-
-                (
-                    (
-                        gps[
-                            "gps_distance_km"
-                        ]
-                        - gps[
-                            "trip_log_distance"
-                        ]
-                    )
-                    / gps[
-                        "trip_log_distance"
-                    ]
-                    * 100
-                ).round(1),
-
-                0
-            )
-
-            gps["flag"] = np.where(
-                gps[
-                    "variance_pct"
-                ].abs() >= 10,
-                "🚩 MISMATCH",
-                "OK"
-            )
-
-            st.dataframe(
-                gps,
-                width="stretch"
-            )
-
-        else:
-            st.info(
-                "No GPS records yet."
-            )
-
-    elif app_mode == "💳 Billing & Subscription":
-        st.title(
-            "💳 BILLING & SUBSCRIPTION"
-        )
-
-        billing_tenant_id = (
-            tenant_filter
-            if is_master
-            and tenant_filter
-            else profile.get(
-                "tenant_id"
-            )
-        )
-
-        if not billing_tenant_id:
-            st.info(
-                "Select a specific tenant "
-                "from the Master Admin tenant selector."
-            )
-
-        else:
-            try:
-                sub_rows = (
-                    client.table(
-                        "billing_subscriptions"
-                    )
-                    .select("*")
-                    .eq(
-                        "tenant_id",
-                        billing_tenant_id
-                    )
-                    .order(
-                        "created_at",
-                        desc=True
-                    )
-                    .limit(1)
-                    .execute()
-                    .data
-                    or []
-                )
-
-                current = (
-                    sub_rows[0]
-                    if sub_rows
-                    else None
-                )
-
-            except Exception as e:
-                current = None
-                st.warning(
-                    f"Could not load subscription: {e}"
-                )
-
-            if current:
-                c1, c2, c3 = st.columns(3)
-
-                c1.metric(
-                    "Plan",
-                    PLAN_LABELS.get(
-                        current.get("plan"),
-                        current.get("plan", "—")
-                    )
-                )
-
-                c2.metric(
-                    "Status",
-                    str(
-                        current.get(
-                            "status",
-                            "—"
-                        )
-                    ).upper()
-                )
-
-                amount_cents = numeric_value(
-                    current.get(
-                        "amount_cents"
-                    )
-                )
-
-                c3.metric(
-                    "Amount",
-                    f"R{amount_cents / 100:,.2f}"
-                )
-
-            else:
-                st.warning(
-                    "No subscription on record."
-                )
-
-            plan = st.selectbox(
-                "Choose a plan",
-                [
-                    "starter",
-                    "professional",
-                    "enterprise"
-                ],
-                format_func=lambda p:
-                    PLAN_LABELS[p]
-            )
-
-            amount = None
-
-            if plan == "enterprise":
-                amount = int(
-                    st.number_input(
-                        "Enterprise monthly amount (R)",
-                        0.0,
-                        step=100.0
-                    )
-                    * 100
-                )
-
-            if st.button(
-                "Proceed to Payment",
-                type="primary"
-            ):
-                if (
-                    plan == "enterprise"
-                    and not amount
-                ):
-                    st.error(
-                        "Enter the enterprise amount."
-                    )
-
-                else:
-                    try:
-                        session = (
-                            st.session_state.get(
-                                "session"
-                            )
-                        )
-
-                        if not session:
-                            raise RuntimeError(
-                                "Your login session is missing. "
-                                "Please log in again."
-                            )
-
-                        token = (
-                            session.access_token
-                        )
-
-                        payload = {
-                            "plan":
-                                plan,
-
-                            "success_url":
-                                f"{APP_BASE_URL}/"
-                                "?billing=success",
-
-                            "cancel_url":
-                                f"{APP_BASE_URL}/"
-                                "?billing=cancelled",
-
-                            "failure_url":
-                                f"{APP_BASE_URL}/"
-                                "?billing=failed",
-                        }
-
-                        if plan == "enterprise":
-                            payload[
-                                "amount_cents"
-                            ] = amount
-
-                        resp = requests.post(
-                            CHECKOUT_FUNCTION_URL,
-
-                            headers={
-                                "Authorization":
-                                    f"Bearer {token}",
-
-                                "apikey":
-                                    SUPABASE_CLIENT_KEY,
-
-                                "Content-Type":
-                                    "application/json",
-                            },
-
-                            json=payload,
-
-                            timeout=30
-                        )
-
-                        try:
-                            data = resp.json()
-                        except ValueError:
-                            data = {
-                                "error":
-                                    resp.text
-                                    or
-                                    f"HTTP {resp.status_code}"
-                            }
-
-                        redirect_url = (
-                            data.get(
-                                "redirectUrl"
-                            )
-                            if isinstance(
-                                data,
-                                dict
-                            )
-                            else None
-                        )
-
-                        if (
-                            resp.ok
-                            and redirect_url
-                        ):
-                            st.success(
-                                "Checkout created successfully."
-                            )
-
-                            st.link_button(
-                                "💳 Pay with Yoco",
-                                redirect_url,
-                                type="primary"
-                            )
-
-                        else:
-                            error_message = (
-                                data.get(
-                                    "error"
-                                )
-                                if isinstance(
-                                    data,
-                                    dict
-                                )
-                                else None
-                            )
-
-                            st.error(
-                                error_message
-                                or
-                                resp.text
-                                or
-                                f"Checkout failed "
-                                f"(HTTP {resp.status_code})."
-                            )
-
-                    except Exception as e:
-                        st.error(
-                            f"Checkout request failed: {e}"
-                        )
-
-            try:
-                hist = (
-                    client.table(
-                        "billing_subscriptions"
-                    )
-                    .select("*")
-                    .eq(
-                        "tenant_id",
-                        billing_tenant_id
-                    )
-                    .order(
-                        "created_at",
-                        desc=True
-                    )
-                    .execute()
-                    .data
-                    or []
-                )
-
-                if hist:
-                    st.subheader(
-                        "Subscription History"
-                    )
-
-                    hist_df = pd.DataFrame(
-                        hist
-                    )
-
-                    if "amount_cents" in hist_df.columns:
-                        hist_df[
-                            "amount_cents"
-                        ] = pd.to_numeric(
-                            hist_df[
-                                "amount_cents"
-                            ],
-                            errors="coerce"
-                        ).fillna(0)
-
-                        hist_df[
-                            "amount_R"
-                        ] = (
-                            hist_df[
-                                "amount_cents"
-                            ]
-                            / 100
-                        )
-
-                    st.dataframe(
-                        hist_df,
-                        width="stretch"
-                    )
-
-            except Exception as e:
-                st.warning(
-                    f"Could not load subscription history: {e}"
-                )
-
-
-if "session" not in st.session_state:
-    show_login()
-else:
-    show_app()
+                can_delete
+                and "id"
+                in drivers_df.columns
+
+Preview truncated for large file
